@@ -80,7 +80,8 @@ from lerobot.common.utils.utils import (
 from lerobot.common.utils.visualization_utils import _init_rerun
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
-
+from lerobot.common.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.common.utils.control_utils import predict_action
 
 import io
 import base64
@@ -175,6 +176,14 @@ def create_robot(cfg: RecordConfig) -> Robot:
     robot.connect()
     return robot
 
+@parser.wrap()
+def create_dataset(cfg: RecordConfig) -> Robot:
+    dataset = LeRobotDataset(
+        cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+    )
+
+    return dataset
 
 async def get_robot_config() -> str:
     """Return the current robot configuration."""
@@ -193,14 +202,25 @@ async def act(instruction: str) -> str:
     Execute a generic instruction.
     Simulates the action and returns a confirmation message.
     """
-    template = f"Pick the {{obj}} and place it at {{target}}"
 
-    await asyncio.sleep(0.1)
+    robot = ROBOTS["main_robot_arm"]["robot"]
+    observation = robot.get_observation()
+
+    observation_frame = build_dataset_frame(dataset.features, observation, prefix="observation")
+    action_values = predict_action(
+                    observation_frame,
+                    policy,
+                    get_safe_torch_device(policy.config.device),
+                    policy.config.use_amp,
+                    task=instruction,
+                    robot_type=robot.robot_type,
+                )
+    action = {key: action_values[i].item() for i, key in enumerate(robot.action_features)}
+    robot.send_action(action)
 
     return f"Successfully executed: {instruction}"
 
 async def get_workspace_description() -> str:
-    # TODO: Replace with image from environment
     img = ROBOTS["main_robot_arm"]["robot"].get_observation()["overview"]
     workspace_img = PILImage.fromarray(img)
 
@@ -266,6 +286,7 @@ async def get_workspace_description() -> str:
 
 if __name__ == "__main__":
 
+    dataset = create_dataset()
     load_dotenv()
     openai_apikey = os.getenv("OPENAI_API_KEY")
 
@@ -275,6 +296,10 @@ if __name__ == "__main__":
             "robot": create_robot()
         },
     }
+
+    policy = SmolVLAPolicy.from_pretrained(
+        "danielkorth/smolvla-whiteboard-and-bike-light",
+    )
 
     with gr.Blocks(title="Robot MCP Server (Gradio)") as demo:
         gr.Markdown("# 🤖 Robot MCP Server")
