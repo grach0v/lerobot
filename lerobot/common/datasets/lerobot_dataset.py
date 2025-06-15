@@ -83,10 +83,12 @@ class LeRobotDatasetMetadata:
         root: str | Path | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
+        token: str | bool | None = None,
     ):
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
         self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        self.token = token
 
         try:
             if force_cache_sync:
@@ -97,7 +99,7 @@ class LeRobotDatasetMetadata:
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
             (self.root / "meta").mkdir(exist_ok=True, parents=True)
-            self.pull_from_repo(allow_patterns="meta/")
+            self.pull_from_repo(allow_patterns="meta/", token=self.token)
             self.load_metadata()
 
     def load_metadata(self):
@@ -116,6 +118,7 @@ class LeRobotDatasetMetadata:
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        token: str | bool | None = None,
     ) -> None:
         snapshot_download(
             self.repo_id,
@@ -124,6 +127,7 @@ class LeRobotDatasetMetadata:
             local_dir=self.root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            token=token,
         )
 
     @property
@@ -342,6 +346,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        token: str | bool | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -443,6 +448,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 True.
             video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            token (str | bool | None, optional): A Hugging Face token to access private datasets. Defaults to None.
         """
         super().__init__()
         self.repo_id = repo_id
@@ -463,7 +469,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Load metadata
         self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync, token=token
         )
         if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
             episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
@@ -553,6 +559,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        token: str | bool | None = None,
     ) -> None:
         snapshot_download(
             self.repo_id,
@@ -561,6 +568,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             local_dir=self.root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            token=token,
         )
 
     def download_episodes(self, download_videos: bool = True) -> None:
@@ -576,7 +584,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.episodes is not None:
             files = self.get_episodes_file_paths()
 
-        self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
+        self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns, token=self.meta.token)
 
     def get_episodes_file_paths(self) -> list[Path]:
         episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
