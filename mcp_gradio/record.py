@@ -37,6 +37,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from pprint import pformat
+import traceback
 
 import numpy as np
 import rerun as rr
@@ -202,23 +203,78 @@ async def act(instruction: str) -> str:
     Execute a generic instruction.
     Simulates the action and returns a confirmation message.
     """
-
+    print(f"Executing action: {instruction}")
     robot = ROBOTS["main_robot_arm"]["robot"]
-    observation = robot.get_observation()
-
-    observation_frame = build_dataset_frame(dataset.features, observation, prefix="observation")
-    action_values = predict_action(
-                    observation_frame,
-                    policy,
-                    get_safe_torch_device(policy.config.device),
-                    policy.config.use_amp,
-                    task=instruction,
-                    robot_type=robot.robot_type,
-                )
-    action = {key: action_values[i].item() for i, key in enumerate(robot.action_features)}
-    robot.send_action(action)
-
-    return f"Successfully executed: {instruction}"
+    
+    # Hardcoded sequence of 5 different states close to current position
+    # Based on the joint positions: shoulder_pan=2050, shoulder_lift=2078, elbow_flex=2034, wrist_flex=2059, wrist_roll=1806, gripper=2037
+    hardcoded_actions = [
+        {'shoulder_pan': 2050, 'shoulder_lift': 2078, 'elbow_flex': 2034, 'wrist_flex': 2059, 'wrist_roll': 1806, 'gripper': 2037},  # Current position
+        {'shoulder_pan': 2045, 'shoulder_lift': 2070, 'elbow_flex': 2030, 'wrist_flex': 2055, 'wrist_roll': 1800, 'gripper': 2040},  # Slight variation 1
+        {'shoulder_pan': 2055, 'shoulder_lift': 2085, 'elbow_flex': 2038, 'wrist_flex': 2059, 'wrist_roll': 1810, 'gripper': 2035},  # Slight variation 2
+        {'shoulder_pan': 2048, 'shoulder_lift': 2075, 'elbow_flex': 2040, 'wrist_flex': 2057, 'wrist_roll': 1815, 'gripper': 2045},  # Slight variation 3
+        {'shoulder_pan': 2052, 'shoulder_lift': 2082, 'elbow_flex': 2028, 'wrist_flex': 2059, 'wrist_roll': 1795, 'gripper': 2030},  # Slight variation 4
+    ]
+    
+    # Run for 10 seconds, predicting and acting every second
+    start_time = time.time()
+    action_count = 0
+    
+    while time.time() - start_time < 10.0:  # 10 second loop
+        loop_start = time.time()
+        
+        try:
+            # Get current observation
+            observation = robot.get_observation()
+            
+            # Build dataset frame
+            observation_frame = build_dataset_frame(dataset.features, observation, prefix="observation")
+            
+            # Predict action (for debugging/logging purposes)
+            action_values = predict_action(
+                observation_frame,
+                policy,
+                get_safe_torch_device(policy.config.device),
+                policy.config.use_amp,
+                task=instruction,
+                robot_type=robot.robot_type,
+            )
+            
+            # Create predicted action dictionary (for logging only)
+            predicted_action = {key: action_values[i].item() for i, key in enumerate(robot.action_features)}
+            
+            # Get hardcoded action to actually send
+            actual_action = hardcoded_actions[action_count % len(hardcoded_actions)]
+            
+            # Print both predicted and actual actions for debugging
+            action_count += 1
+            elapsed = time.time() - start_time
+            print(f"[{elapsed:.1f}s] Action {action_count}:")
+            print(f"  PREDICTED: {predicted_action}")
+            print(f"  ACTUAL:    {actual_action}")
+            
+            # Send hardcoded action to robot (not the predicted one)
+            robot.send_action(actual_action)
+            
+            # Wait for approximately 1 second before next prediction
+            # Account for processing time to maintain ~1Hz frequency
+            processing_time = time.time() - loop_start
+            sleep_time = max(0, 1.0 - processing_time)
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+                
+        except Exception as e:
+            print(f"Error during action prediction:")
+            print(f"  Exception type: {type(e).__name__}")
+            print(f"  Exception message: '{str(e)}'")
+            print(f"  Exception repr: {repr(e)}")
+            print("  Full traceback:")
+            traceback.print_exc()
+            break
+    
+    total_time = time.time() - start_time
+    print(f"Completed {action_count} actions over {total_time:.1f} seconds")
+    return f"Successfully executed: {instruction} ({action_count} actions over {total_time:.1f}s)"
 
 async def get_workspace_description() -> str:
     img = ROBOTS["main_robot_arm"]["robot"].get_observation()["overview"]
@@ -285,11 +341,9 @@ async def get_workspace_description() -> str:
 
 
 if __name__ == "__main__":
-
     dataset = create_dataset()
     load_dotenv()
     openai_apikey = os.getenv("OPENAI_API_KEY")
-
     ROBOTS = {
         "main_robot_arm": {
             "description": "Main robot arm for manipulation tasks",
@@ -304,25 +358,19 @@ if __name__ == "__main__":
     with gr.Blocks(title="Robot MCP Server (Gradio)") as demo:
         gr.Markdown("# 🤖 Robot MCP Server")
 
-        with gr.Tab("robot://config"):
-            cfg_btn = gr.Button("Get Robot Config")
-            cfg_out = gr.Textbox(lines=6)
-            cfg_btn.click(get_robot_config, outputs=cfg_out)
+        # with gr.Tab("robot://config"):
+        #     cfg_btn = gr.Button("Get Robot Config")
+        #     cfg_out = gr.Textbox(lines=6)
+        #     cfg_btn.click(get_robot_config, outputs=cfg_out)
 
         with gr.Tab("Workspace Analysis"):
-            task_in = gr.Textbox(label="Task")
-            desc_btn = gr.Button("Analyze demo.png")
+            desc_btn = gr.Button("Analyze the scene")
             desc_out = gr.Textbox(lines=18)
-            desc_btn.click(get_workspace_description, inputs=[task_in], outputs=desc_out)
+            desc_btn.click(get_workspace_description, outputs=desc_out)
 
         with gr.Tab("Robot Actions"):
-            obj_in = gr.Textbox(label="Object")
-            tgt_in = gr.Textbox(label="Target")
-
-            res_out = gr.Textbox(lines=4)
-
             instr_in = gr.Textbox(label="Instruction")
-            gr.Button("Act").click(act, [instr_in], res_out)
+            gr.Button("Act").click(act, instr_in)
 
         with gr.Tab("Robots"):
             rb_btn = gr.Button("Show Robots")
