@@ -38,6 +38,7 @@ from lerobot.policies.sac.reward_model.configuration_classifier import RewardCla
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+from lerobot.policies.remote.configuration_remote import RemoteConfig
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from lerobot.processor.converters import (
     batch_to_transition,
@@ -101,6 +102,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "remote":
+        from lerobot.policies.remote.modeling_remote import RemotePolicy
+
+        return RemotePolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -142,6 +147,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SmolVLAConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
+    elif policy_type == "remote":
+        return RemoteConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 
@@ -291,6 +298,15 @@ def make_pre_post_processors(
         processors = make_smolvla_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
+        )
+    
+    elif isinstance(policy_cfg, RemoteConfig):
+        from lerobot.policies.remote.processor_remote import make_remote_pre_post_processors
+
+        processors = make_remote_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+            rename_map=kwargs.get("preprocessor_overrides").get("rename_observations_processor").get("rename_map"),
         )
 
     else:
