@@ -1,7 +1,9 @@
+from collections import deque
+import threading
+
 import numpy as np
 import requests
 import torch
-from collections import deque
 from torch import Tensor
 
 from lerobot.utils.messaging import pack_msg, unpack_msg
@@ -20,22 +22,32 @@ class RemotePolicy(PreTrainedPolicy):
     def __init__(self, config: RemoteConfig):
         super().__init__(config)
         self.server_url = config.server_url.rstrip("/")
-        self.session = requests.Session()
         self.timeout = config.timeout
+        self._thread_state = threading.local()
         self.reset()
 
     def get_optim_params(self) -> dict:
         return {}
 
     def reset(self):
-        # Queue emits one action per env step; refilled when empty
-        self._action_queue = deque(maxlen=self.config.n_action_steps)
+        # Reinitialize thread-local state so each worker gets its own queue/session
+        self._thread_state = threading.local()
+
+    def _state(self):
+        state = self._thread_state
+        if not hasattr(state, "session"):
+            state.session = requests.Session()
+        if not hasattr(state, "action_queue"):
+            state.action_queue = deque(maxlen=self.config.n_action_steps)
+        return state
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict] | tuple[Tensor, None]:
         raise NotImplementedError("RemotePolicy is inference-only")
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+        state = self._state()
+
         # Build payload with raw tensors/arrays; pack_msg handles encoding
         add_args = self.config.additional_args or {}
         payload = batch | add_args
@@ -45,7 +57,7 @@ class RemotePolicy(PreTrainedPolicy):
         last_exception = None
         for _ in range(self.config.attempts):
             try:
-                resp = self.session.post(
+                resp = state.session.post(
                     f"{self.server_url}/predict",
                     data=packed,
                     headers={"Content-Type": "application/octet-stream"},
@@ -60,19 +72,23 @@ class RemotePolicy(PreTrainedPolicy):
             raise last_exception
 
         unpacked = unpack_msg(resp.content)
-        actions_np = np.asarray(unpacked)
+        if isinstance(unpacked, torch.Tensor):
+            actions = unpacked
+        else:
+            actions_np = np.asarray(unpacked)
+            actions = torch.from_numpy(actions_np)
 
         device = torch.device(self.config.device)
-
-        actions = torch.from_numpy(actions_np).to(device=device, dtype=torch.float32)
-        return actions
+        return actions.to(device=device, dtype=torch.float32)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         self.eval()
 
-        if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-            self._action_queue.extend(actions.transpose(0, 1))  # [(B, A)] x T
+        queue = self._state().action_queue
 
-        return self._action_queue.popleft()
+        if len(queue) == 0:
+            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            queue.extend(actions.transpose(0, 1))  # [(B, A)] x T
+
+        return queue.popleft()

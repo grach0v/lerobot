@@ -306,7 +306,7 @@ def make_pre_post_processors(
         processors = make_remote_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
-            rename_map=kwargs.get("preprocessor_overrides").get("rename_observations_processor").get("rename_map"),
+            rename_map=kwargs.get("preprocessor_overrides", {}).get("rename_observations_processor", {}).get("rename_map", {}),
         )
 
     else:
