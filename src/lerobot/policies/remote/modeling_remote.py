@@ -34,29 +34,9 @@ class RemotePolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict] | tuple[Tensor, None]:
         raise NotImplementedError("RemotePolicy is inference-only")
 
-    def custom_prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        batch.pop('action')
-        batch.pop('next.reward')
-        batch.pop('next.done')
-        batch.pop('next.truncated')
-        batch.pop('info')
-
-        task = batch.pop('task')
-        batch['observation.task_instr'] = task
-
-        if not hasattr(self, 'previous_state'):
-            self.previous_state = batch["observation.state"].clone()
-        
-        batch["observation.state"] = torch.stack([self.previous_state, batch["observation.state"]], dim=1)
-        self.previous_state = batch["observation.state"][:, -1].clone()
-
-        return batch
-
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         # Build payload with raw tensors/arrays; pack_msg handles encoding
-
-        batch = self.custom_prepare_batch(batch)
         add_args = self.config.additional_args or {}
         payload = batch | add_args
 
@@ -83,10 +63,8 @@ class RemotePolicy(PreTrainedPolicy):
         actions_np = np.asarray(unpacked)
 
         device = torch.device(self.config.device)
-        any_tensor = next((v for v in batch.values() if isinstance(v, torch.Tensor)), None)
-        dtype = any_tensor.dtype if isinstance(any_tensor, torch.Tensor) else torch.float32
 
-        actions = torch.from_numpy(actions_np).to(device=device, dtype=dtype)
+        actions = torch.from_numpy(actions_np).to(device=device, dtype=torch.float32)
         return actions
 
     @torch.no_grad()
