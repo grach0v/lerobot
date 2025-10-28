@@ -1,5 +1,5 @@
-import torch
 import numpy as np
+import torch
 from fastapi import FastAPI, Request, Response
 
 from lerobot.utils.messaging import pack_msg, unpack_msg
@@ -18,14 +18,16 @@ async def predict(request: Request):
     action_dim = dataset_info.get("action_dof", 7)
 
     # Try to infer batch size from any array-like input
-    B = None
+    batch_size = None
     for v in obs_input.values():
-        if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray):
-            if v.ndim >= 1:
-                B = int(v.shape[0])
-                break
+        if isinstance(v, (torch.Tensor, np.ndarray)) and v.ndim > 0:
+            batch_size = int(v.shape[0])
+            break
 
-    actions = torch.zeros((B, n_action_steps, action_dim), dtype=torch.float32)
+    if batch_size is None:
+        batch_size = 1  # Default to batch size 1 if no array-like inputs found
+
+    actions = torch.zeros((batch_size, n_action_steps, action_dim), dtype=torch.float32)
 
     packed = pack_msg(actions)
     return Response(content=packed, media_type="application/octet-stream")

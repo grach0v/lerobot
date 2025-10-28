@@ -4,6 +4,7 @@ from typing import Any
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim.optimizers import AdamWConfig
 
+
 @PreTrainedConfig.register_subclass("remote")
 @dataclass
 class RemoteConfig(PreTrainedConfig):
@@ -28,7 +29,7 @@ class RemoteConfig(PreTrainedConfig):
 
     # --- Abstract API implementations required by PreTrainedConfig ---
     def get_optimizer_preset(self) -> AdamWConfig:
-        """Remote policy is inference-only; return a inert preset for API compatibility."""
+        """Remote policy is inference-only; return an inert preset for API compatibility."""
         return AdamWConfig(lr=1e-5, weight_decay=0.0, grad_clip_norm=1.0)
 
     def get_scheduler_preset(self):
