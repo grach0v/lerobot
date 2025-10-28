@@ -30,6 +30,8 @@ class TorchSerialize:
         t = o["type"]
         arr = np.frombuffer(o["data"], dtype=dtype)
         arr = arr.reshape(o["shape"])
+        if not arr.flags.writeable:
+            arr = arr.copy()
 
         if t == "tensor":
             retval = torch.as_tensor(arr)
@@ -135,4 +137,3 @@ def unpack_msg(packed: bytes, with_header: bool = False) -> Any:
         return unpacked
     else:
         return rm_envelope(unpacked)
-
