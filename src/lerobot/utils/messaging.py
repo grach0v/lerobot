@@ -13,7 +13,7 @@ import torch
 class TorchSerialize:
     def encodes(self, o: Union[torch.Tensor, np.ndarray]) -> dict:
         if isinstance(o, torch.Tensor):
-            np_data = o.numpy()
+            np_data = o.detach().cpu().numpy()
             return {
                 "data": np_data.tobytes(), "dtype": np_data.dtype.str, "encoding": "raw_bytes", "shape": o.shape, "type": "tensor"
             }
