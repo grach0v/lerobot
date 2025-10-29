@@ -33,12 +33,12 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.remote.configuration_remote import RemoteConfig
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
-from lerobot.policies.remote.configuration_remote import RemoteConfig
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from lerobot.processor.converters import (
     batch_to_transition,
@@ -299,7 +299,7 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
-    
+
     elif isinstance(policy_cfg, RemoteConfig):
         from lerobot.policies.remote.processor_remote import make_remote_pre_post_processors
 
@@ -368,6 +368,9 @@ def make_policy(
     policy_cls = get_policy_class(cfg.type)
 
     kwargs = {}
+    if cfg.type == "remote":
+        cfg.rename_map = rename_map or {}
+
     if ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
     else:
