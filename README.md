@@ -321,7 +321,7 @@ lerobot-eval \
   --policy.remote_policy_type=pi05 \
   --policy.remote_pretrained_name_or_path=lerobot/pi05_libero_finetuned \
   --policy.remote_policy_device=cuda \
-  --rename_map='{"observation.images.image":"observation.images.static1","observation.images.image2":"observation.images.wrist1"}' \
+  --rename_map='"--rename_map={"observation.images.empty_camera_0":"observation.images.image"}' \
   --output_dir=./eval_logs_libero_spatial
 ```
 
