@@ -125,6 +125,160 @@ lerobot-eval \
 
 Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
 
+---
+
+## A2 Pick-and-Place Benchmark
+
+This fork includes the **A2 Pick-and-Place Benchmark** - a language-conditioned manipulation benchmark using PyBullet simulation with UR5e robot and Robotiq gripper.
+
+### Quick Setup from Scratch
+
+```bash
+# 1. Clone this repository
+git clone https://github.com/grach0v/lerobot.git
+cd lerobot
+git checkout a2_pp_bench
+
+# 2. Create uv environment and install dependencies
+uv venv --python 3.10
+source .venv/bin/activate
+uv pip install -e ".[a2]"
+
+# 3. Clone and install A2 policy package
+cd ..
+git clone https://github.com/grach0v/lerobot_policy_a2.git
+cd lerobot_policy_a2
+uv pip install -e .
+cd ../lerobot
+
+# 4. Clone A2 simulation (for benchmark scripts and assets)
+cd ..
+git clone https://github.com/grach0v/A2.git A2_bench
+cd A2_bench
+uv pip install -e .
+
+# 5. Download simulation assets from HuggingFace
+python scripts/setup/download_resources.py
+```
+
+### Running the Benchmark
+
+The A2 benchmark evaluates language-conditioned grasping and pick-and-place policies.
+
+#### Grasp (Pick) Evaluation
+
+```bash
+cd A2_bench
+
+# Run grasp evaluation with trained model
+python -m a2.evaluate.test_pick \
+    --load_model \
+    --model_path path/to/checkpoint.pth \
+    --num_episode 50 \
+    --use_rope
+
+# Run with CLIP baseline (no trained model)
+python -m a2.evaluate.test_pick \
+    --direct_grounding \
+    --num_episode 50
+
+# Run on unseen objects
+python -m a2.evaluate.test_pick \
+    --unseen \
+    --load_model \
+    --model_path path/to/checkpoint.pth
+```
+
+#### Pick-and-Place Evaluation
+
+```bash
+# Run full pick-and-place evaluation
+python -m a2.evaluate.test_pickplace \
+    --load_model \
+    --model_path path/to/checkpoint.pth \
+    --num_episode 50 \
+    --use_rope
+
+# With GUI visualization
+python -m a2.evaluate.test_pickplace \
+    --gui \
+    --load_model \
+    --model_path path/to/checkpoint.pth
+```
+
+### Using A2 Environment with LeRobot
+
+```python
+from lerobot.envs.configs import A2EnvConfig
+from lerobot.envs.factory import make_env
+
+# Create A2 environment
+config = A2EnvConfig(
+    task="pick_and_place",  # or "grasp"
+    object_set="train",     # or "test" for unseen objects
+    num_objects=8,
+    camera_name="front,overview,gripper",
+)
+
+env = make_env(config)
+obs, info = env.reset()
+
+# Run episode
+done = False
+while not done:
+    action = policy.select_action(obs)
+    obs, reward, done, truncated, info = env.step(action)
+```
+
+### Data Collection for VLA Training
+
+Record demonstrations in LeRobot dataset format:
+
+```bash
+# Collect grasp demonstrations
+python data_collection/collect_data_grasp.py \
+    --num_episode 1000 \
+    --num_obj 8 \
+    --record_vla \
+    --vla_output data/a2_grasp_vla
+
+# Collect pick-and-place demonstrations
+python data_collection/collect_data_pp.py \
+    --num_episode 1000 \
+    --record_vla \
+    --vla_output data/a2_pp_vla
+```
+
+### Model Checkpoints
+
+Pre-trained A2 policy checkpoints are available on HuggingFace:
+
+| Model | Task | Success Rate | Link |
+|-------|------|--------------|------|
+| A2-ViLGP3D-Grasp | Grasping | ~85% | `dgrachev/a2_grasp` |
+| A2-ViLGP3D-PP | Pick-and-Place | ~70% | `dgrachev/a2_pickplace` |
+
+### Benchmark Tasks
+
+The A2 benchmark includes:
+
+1. **Language-Conditioned Grasping**: "Give me the banana", "Grasp a red object", etc.
+2. **Spatial Place**: "Put it next to the cup", "Place this near the bowl"
+3. **Pick-and-Place**: Combined grasp + place with language instructions
+
+### Key Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--num_episode` | Number of evaluation episodes | 15 |
+| `--num_obj` | Objects per scene | 8-15 |
+| `--use_rope` | Use RoPE position encoding | False |
+| `--unseen` | Evaluate on unseen objects | False |
+| `--gui` | Show PyBullet GUI | False |
+| `--direct_grounding` | Use CLIP baseline | False |
+
+---
+
 ## Resources
 
 - **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
