@@ -344,6 +344,85 @@ class LiberoEnv(EnvConfig):
         }
 
 
+@EnvConfig.register_subclass("a2")
+@dataclass
+class A2EnvConfig(EnvConfig):
+    """A2 Environment for tabletop manipulation with UR5e robot.
+
+    Supports grasp and pick-and-place tasks with configurable object sets.
+    """
+
+    task: str = "grasp"  # "grasp" or "pick_and_place"
+    fps: int = 30
+    episode_length: int = 500
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    camera_name: str = "front,overview,gripper"
+    object_set: str = "train"  # "train" (simplified_objects) or "test" (unseen_objects)
+    num_objects: int = 8
+    observation_height: int = 480
+    observation_width: int = 640
+    include_depth: bool = True
+    action_mode: str = "pose"  # "pose", "delta_ee", or "joint"
+    gui: bool = False
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),  # xyz + quaternion
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            "observation.images.image": f"{OBS_IMAGES}.image",
+            "observation.images.image2": f"{OBS_IMAGES}.image2",
+            "observation.images.image3": f"{OBS_IMAGES}.image3",
+            "observation.state": OBS_STATE,
+        }
+    )
+
+    def __post_init__(self):
+        # Add image features for each camera
+        cameras = [c.strip() for c in self.camera_name.split(",")]
+        camera_mapping = {"front": "image", "overview": "image2", "gripper": "image3"}
+
+        for cam in cameras:
+            key = camera_mapping.get(cam, cam)
+            self.features[f"observation.images.{key}"] = PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(self.observation_height, self.observation_width, 3),
+            )
+
+        if self.obs_type == "pixels_agent_pos":
+            # Robot state: joints(6) + ee_pos(3) + ee_quat(4) + gripper(1) = 14
+            self.features["observation.state"] = PolicyFeature(
+                type=FeatureType.STATE,
+                shape=(14,),
+            )
+
+        if self.include_depth:
+            self.features["observation.depth"] = PolicyFeature(
+                type=FeatureType.STATE,
+                shape=(self.observation_height, self.observation_width),
+            )
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "task": self.task,
+            "object_set": self.object_set,
+            "num_objects": self.num_objects,
+            "camera_name": self.camera_name,
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "include_depth": self.include_depth,
+            "action_mode": self.action_mode,
+            "episode_length": self.episode_length,
+            "gui": self.gui,
+        }
+
+
 @EnvConfig.register_subclass("metaworld")
 @dataclass
 class MetaworldEnv(EnvConfig):
