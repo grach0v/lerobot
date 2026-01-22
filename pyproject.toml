@@ -158,7 +158,13 @@ aloha = ["gym-aloha>=0.1.2,<0.2.0"]
 pusht = ["gym-pusht>=0.1.5,<0.2.0", "pymunk>=6.6.0,<7.0.0"] # TODO: Fix pymunk version in gym-pusht instead
 libero = ["lerobot[transformers-dep]", "hf-libero>=0.1.3,<0.2.0"]
 metaworld = ["metaworld==3.0.0"]
-a2 = ["pybullet>=3.2.5", "open3d>=0.17.0", "scipy>=1.10.0"]
+a2 = [
+    "pybullet>=3.2.5",
+    "open3d>=0.17.0",
+    "scipy>=1.10.0",
+    "graspnetAPI>=1.2.11",
+    "lerobot-policy-a2 @ file:///home/dgrachev/git/A2_lerobot/lerobot_policy_a2",
+]
 
 # All
 all = [
@@ -388,6 +394,20 @@ ignore_errors = false
 # ignore_errors = false
 
 [tool.uv]
+# Override deprecated/pinned dependencies from graspnetAPI
+override-dependencies = [
+    "sklearn ; python_version < '0'",  # deprecated, scikit-learn provides it
+    "numpy>=1.26.0,<3.0.0",
+    "transforms3d>=0.4.0",
+    "pillow>=10.0.0",
+    "scipy>=1.12.0",
+    "matplotlib>=3.8.0",
+    "opencv-python>=4.9.0",
+    "tqdm>=4.66.0",
+    "autolab-core>=1.1.0",
+    "trimesh>=4.0.0",
+]
+
 # wallx requires transformers==4.49.0 which conflicts with other extras that need >=4.53.0
 conflicts = [
     [

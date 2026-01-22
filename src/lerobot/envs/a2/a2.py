@@ -21,7 +21,6 @@ supporting grasp and pick-and-place tasks with configurable object sets.
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
@@ -34,7 +33,11 @@ from huggingface_hub import snapshot_download
 
 
 def get_a2_assets_path() -> Path:
-    """Get path to A2 assets, downloading if necessary."""
+    """Get path to A2 assets, downloading if necessary.
+
+    Downloads from HuggingFace: dgrachev/a2_assets
+    Contains: simplified_objects, unseen_objects, ur5e, workspace, testing_cases
+    """
     cache_dir = Path.home() / ".cache" / "a2_assets"
 
     if not cache_dir.exists() or not (cache_dir / "simplified_objects").exists():
@@ -47,6 +50,36 @@ def get_a2_assets_path() -> Path:
         print(f"A2 assets downloaded to {cache_dir}")
 
     return cache_dir
+
+
+def get_testing_cases_path(task: str = "grasp", object_set: str = "train") -> Path:
+    """Get path to testing cases for benchmark evaluation.
+
+    Args:
+        task: "grasp", "place", or "pickplace"
+        object_set: "train" (seen) or "test" (unseen)
+
+    Returns:
+        Path to the testing cases directory
+    """
+    assets_path = get_a2_assets_path()
+
+    task_dir_map = {
+        "grasp": "grasp_testing_cases",
+        "place": "place_testing_cases",
+        "pickplace": "pp_testing_cases",
+        "pick_and_place": "pp_testing_cases",
+    }
+
+    set_dir_map = {
+        "train": "seen",
+        "test": "unseen",
+    }
+
+    task_dir = task_dir_map.get(task, "grasp_testing_cases")
+    set_dir = set_dir_map.get(object_set, "seen")
+
+    return assets_path / "testing_cases" / task_dir / set_dir
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -144,23 +177,13 @@ class A2Env(gym.Env):
 
     def _init_env(self):
         """Initialize the underlying PyBullet environment."""
-        # Add A2 to path
-        a2_path = Path(__file__).parent.parent.parent.parent.parent.parent / "A2_new"
-        if not a2_path.exists():
-            # Try current working directory
-            a2_path = Path.cwd()
-            if not (a2_path / "env" / "environment_sim.py").exists():
-                a2_path = Path.cwd().parent
-
-        if str(a2_path) not in sys.path:
-            sys.path.insert(0, str(a2_path))
-
         # Setup asset symlinks
         self._setup_asset_symlinks()
 
-        # Import and create environment
-        from env.environment_sim import Environment
-        self._env = Environment(gui=self.gui)
+        # Import and create environment from local module
+        from .a2_sim import Environment
+
+        self._env = Environment(gui=self.gui, object_set=self.object_set)
 
         # Setup workspace based on task
         workspace = "extend" if self.task == "pick_and_place" else "raw"
@@ -286,12 +309,27 @@ class A2Env(gym.Env):
         workspace = "extend" if self.task == "pick_and_place" else "raw"
         self._env.reset(workspace=workspace)
 
-        # Add objects based on object_set
-        object_dir = "simplified_objects" if self.object_set == "train" else "unseen_objects"
-        self._env.add_objects_for_place(
-            num_obj=self.num_objects,
-            workspace_limits=self._env.bounds,
-        )
+        # Generate language goal first - this sets up target_obj_lst
+        lang_goal = self._env.generate_lang_goal()
+
+        # Add objects for grasp task (uses target_obj_lst)
+        if self.task == "grasp":
+            for i in range(10):  # Retry up to 10 times
+                self._env.add_objects(
+                    num_obj=self.num_objects,
+                    workspace_limits=self._env.bounds,
+                )
+                if len(self._env.target_obj_ids) > 0:
+                    break
+                # Reset and try again
+                self._env.reset(workspace=workspace)
+                lang_goal = self._env.generate_lang_goal()
+        else:
+            # For place task, use add_objects_for_place
+            self._env.add_objects_for_place(
+                num_obj=self.num_objects,
+                workspace_limits=self._env.bounds,
+            )
 
         observation = self._get_observation()
         info = {
@@ -313,10 +351,8 @@ class A2Env(gym.Env):
         reward = 0.0
 
         if self.action_mode == "pose":
-            # Convert action to pose tuple
-            pos = tuple(action[:3])
-            quat = tuple(action[3:7])
-            pose = (pos, quat)
+            # Pass action as 7D array (grasp/place expect this format)
+            pose = action[:7]
 
             if self.task == "grasp":
                 success, grasped_obj_id, _ = self._env.grasp(pose)
@@ -330,16 +366,18 @@ class A2Env(gym.Env):
             current_pos = robot_state["ee_pos"]
             current_quat = robot_state["ee_quat"]
 
+            # Action is in [-1, 1] range, scale to meters (1.0 → 1cm movement)
             delta_pos = action[:3] * 0.01
             new_pos = current_pos + delta_pos
 
             pose = (tuple(new_pos), tuple(current_quat))
-            self._env.move_ee_pose(pose)
+            # Use non-blocking VLA-style step (not blocking move_ee_pose)
+            self._env.step_ee_pose(pose, num_sim_steps=8)
 
             if action[6] > 0.5:
-                self._env.close_gripper()
+                self._env.close_gripper(blocking=False)
             else:
-                self._env.open_gripper()
+                self._env.open_gripper(blocking=False)
 
         elif self.action_mode == "joint":
             joint_targets = action[:6]
@@ -376,8 +414,109 @@ class A2Env(gym.Env):
     def close(self):
         """Clean up environment."""
         if self._env is not None:
-            del self._env
+            self._env.close()
             self._env = None
+
+    # ==================== Benchmark Methods ====================
+
+    def load_test_case(self, file_path: str, test_type: str = "grasp"):
+        """Load a benchmark test case from file.
+
+        Args:
+            file_path: Path to test case file
+            test_type: Type of test - "grasp", "place", or "pickplace"
+
+        Returns:
+            For grasp: (success, lang_goal)
+            For place: (success, lang_goal)
+            For pickplace: (success, grasp_lang_goal, place_lang_goal)
+        """
+        workspace = "extend" if test_type == "pickplace" else "raw"
+        self._env.reset(workspace=workspace)
+
+        if test_type == "grasp":
+            return self._env.add_object_push_from_file(file_path)
+        elif test_type == "place":
+            return self._env.add_object_push_from_place_file(file_path)
+        elif test_type == "pickplace":
+            return self._env.add_object_push_from_pickplace_file(file_path, mode="grasp")
+        else:
+            raise ValueError(f"Unknown test_type: {test_type}")
+
+    def get_lang_goal(self) -> str:
+        """Get the current language goal."""
+        return getattr(self._env, 'lang_goal', None)
+
+    def get_target_obj_ids(self) -> list:
+        """Get list of target object IDs."""
+        return getattr(self._env, 'target_obj_ids', [])
+
+    def get_reference_obj_ids(self) -> list:
+        """Get list of reference object IDs (for place tasks)."""
+        return getattr(self._env, 'reference_obj_ids', [])
+
+    # ==================== Data Collection Methods ====================
+
+    def setup_vla_recorder(
+        self,
+        output_dir: str,
+        repo_id: str = "local/a2_dataset",
+        fps: int = 30,
+        image_size: tuple = (480, 640),
+        cameras: list = None,
+    ):
+        """Setup VLA recording for data collection.
+
+        Args:
+            output_dir: Directory to save the dataset
+            repo_id: Repository ID for the LeRobot dataset
+            fps: Recording frames per second
+            image_size: Image size as (height, width)
+            cameras: List of camera names to record
+
+        Returns:
+            VLARecorder instance
+        """
+        from .a2_recorder import VLARecorder
+
+        cameras = cameras or list(self.camera_name)
+        recorder = VLARecorder(
+            output_dir=output_dir,
+            repo_id=repo_id,
+            fps=fps,
+            image_size=image_size,
+            cameras=cameras,
+        )
+
+        # Set up frame recording in the underlying environment
+        render_size = (self.observation_height, self.observation_width)
+        self._env.set_frame_recorder(
+            recorder.record_frame,
+            fps=fps,
+            cameras=cameras,
+            render_size=render_size,
+        )
+
+        return recorder
+
+    def clear_vla_recorder(self):
+        """Clear VLA recording setup."""
+        self._env.clear_frame_recorder()
+
+    # ==================== Low-level Access ====================
+
+    @property
+    def sim_env(self):
+        """Access the underlying PyBullet simulation environment.
+
+        This provides direct access to the Environment class for advanced
+        operations like:
+        - env.sim_env.grasp(pose)
+        - env.sim_env.place(pose)
+        - env.sim_env.get_true_object_poses()
+        - env.sim_env.get_camera_images()
+        """
+        return self._env
 
 
 def _make_env_fn(
