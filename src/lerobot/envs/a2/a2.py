@@ -18,11 +18,11 @@
 This module provides a gymnasium-compatible environment for the A2 simulation,
 supporting grasp and pick-and-place tasks with configurable object sets.
 """
+
 from __future__ import annotations
 
-import os
+import contextlib
 from collections.abc import Callable, Sequence
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +108,7 @@ class A2Env(gym.Env):
 
     Supports grasp and pick-and-place tasks with UR5e robot and Robotiq gripper.
     """
+
     metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
 
     def __init__(
@@ -199,10 +200,8 @@ class A2Env(gym.Env):
             src = self.assets_path / asset_dir
             dst = local_assets / asset_dir
             if src.exists() and not dst.exists():
-                try:
+                with contextlib.suppress(OSError):
                     dst.symlink_to(src)
-                except OSError:
-                    pass
 
     def _setup_observation_space(self):
         """Setup gymnasium observation space."""
@@ -227,12 +226,14 @@ class A2Env(gym.Env):
             )
 
         if self.obs_type == "pixels_agent_pos":
-            obs_dict["robot_state"] = spaces.Dict({
-                "joints": spaces.Box(low=-np.pi, high=np.pi, shape=(6,), dtype=np.float64),
-                "ee_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
-                "ee_quat": spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float64),
-                "gripper_angle": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float64),
-            })
+            obs_dict["robot_state"] = spaces.Dict(
+                {
+                    "joints": spaces.Box(low=-np.pi, high=np.pi, shape=(6,), dtype=np.float64),
+                    "ee_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
+                    "ee_quat": spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float64),
+                    "gripper_angle": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float64),
+                }
+            )
 
         self.observation_space = spaces.Dict(obs_dict)
 
@@ -309,12 +310,12 @@ class A2Env(gym.Env):
         workspace = "extend" if self.task == "pick_and_place" else "raw"
         self._env.reset(workspace=workspace)
 
-        # Generate language goal first - this sets up target_obj_lst
-        lang_goal = self._env.generate_lang_goal()
-
-        # Add objects for grasp task (uses target_obj_lst)
         if self.task == "grasp":
-            for i in range(10):  # Retry up to 10 times
+            # Generate language goal first - this sets up target_obj_lst
+            lang_goal = self._env.generate_lang_goal()
+
+            # Add objects for grasp task (uses target_obj_lst)
+            for _i in range(10):  # Retry up to 10 times
                 self._env.add_objects(
                     num_obj=self.num_objects,
                     workspace_limits=self._env.bounds,
@@ -324,12 +325,49 @@ class A2Env(gym.Env):
                 # Reset and try again
                 self._env.reset(workspace=workspace)
                 lang_goal = self._env.generate_lang_goal()
-        else:
-            # For place task, use add_objects_for_place
+        elif self.task == "place":
+            # For place, add objects first then build place language goal
             self._env.add_objects_for_place(
                 num_obj=self.num_objects,
                 workspace_limits=self._env.bounds,
             )
+            bbox_ids, bbox_centers, bbox_sizes = self._env.get_obj_bboxes_from_aabb()
+            lang_goal, _, _, _, _ = self._env.generate_place_lang_goal(
+                bbox_ids, bbox_centers, bbox_sizes, pp_file=False
+            )
+            if not lang_goal:
+                lang_goal = "place an object"
+        else:
+            # For pick_and_place: generate BOTH grasp and place goals
+            # First generate grasp goal (sets up target_obj_lst)
+            grasp_lang_goal = self._env.generate_lang_goal()
+
+            # Add objects using add_objects() to properly set target_obj_ids
+            for _i in range(10):
+                self._env.add_objects(
+                    num_obj=self.num_objects,
+                    workspace_limits=self._env.bounds,
+                )
+                if len(self._env.target_obj_ids) > 0:
+                    break
+                self._env.reset(workspace="extend")
+                grasp_lang_goal = self._env.generate_lang_goal()
+
+            # Generate place goal
+            bbox_ids, bbox_centers, bbox_sizes = self._env.get_obj_bboxes_from_aabb()
+            place_lang_goal, _, _, _, _ = self._env.generate_place_lang_goal(
+                bbox_ids, bbox_centers, bbox_sizes, pp_file=True
+            )
+
+            # Combine goals: "grasp X and place it Y"
+            if place_lang_goal:
+                lang_goal = f"{grasp_lang_goal} and {place_lang_goal}"
+            else:
+                lang_goal = grasp_lang_goal
+
+            # Store both for separate access
+            self._env.grasp_lang_goal = grasp_lang_goal
+            self._env.place_lang_goal = place_lang_goal
 
         observation = self._get_observation()
         info = {
@@ -445,15 +483,15 @@ class A2Env(gym.Env):
 
     def get_lang_goal(self) -> str:
         """Get the current language goal."""
-        return getattr(self._env, 'lang_goal', None)
+        return getattr(self._env, "lang_goal", None)
 
     def get_target_obj_ids(self) -> list:
         """Get list of target object IDs."""
-        return getattr(self._env, 'target_obj_ids', [])
+        return getattr(self._env, "target_obj_ids", [])
 
     def get_reference_obj_ids(self) -> list:
         """Get list of reference object IDs (for place tasks)."""
-        return getattr(self._env, 'reference_obj_ids', [])
+        return getattr(self._env, "reference_obj_ids", [])
 
     # ==================== Data Collection Methods ====================
 
@@ -529,6 +567,7 @@ def _make_env_fn(
     episode_index: int = 0,
 ) -> Callable[[], A2Env]:
     """Create factory callable for A2Env."""
+
     def _make_env() -> A2Env:
         return A2Env(
             task=task,
@@ -538,6 +577,7 @@ def _make_env_fn(
             episode_length=episode_length,
             **gym_kwargs,
         )
+
     return _make_env
 
 

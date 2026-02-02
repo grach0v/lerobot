@@ -144,11 +144,26 @@ uv venv --python 3.10
 source .venv/bin/activate
 uv pip install -e ".[a2]"
 
+# 2b. (Optional) GPU setup for RTX 50-series / CUDA 12.8
+# Install CUDA toolkit (nvcc) so PointNet2 kernels can compile
+sudo apt-get update
+sudo apt-get install -y nvidia-cuda-toolkit
+
+# Ensure torch/torchvision are pulled from the cu128 index
+uv pip install --upgrade torch torchvision
+
 # 3. Clone and install A2 policy package
 cd ..
 git clone https://github.com/grach0v/lerobot_policy_a2.git
 cd lerobot_policy_a2
 uv pip install -e .
+
+# 3b. (Optional) Build PointNet2 CUDA extension (improves grasp success rate)
+# If nvcc >= 12.8 is available, use TORCH_CUDA_ARCH_LIST=12.0
+# Otherwise use a PTX build that can JIT on newer GPUs (slower): 9.0+PTX
+cd src/lerobot_policy_a2/graspnet/pointnet2
+TORCH_CUDA_ARCH_LIST=9.0+PTX uv run python setup.py build_ext --inplace
+cd ../../../..
 cd ../lerobot
 
 # 4. Clone A2 simulation (for benchmark scripts and assets)
@@ -158,7 +173,8 @@ cd A2_bench
 uv pip install -e .
 
 # 5. Download simulation assets from HuggingFace
-python scripts/setup/download_resources.py
+uv run hf download dgrachev/a2_assets --repo-type dataset --local-dir ~/.cache/a2_assets
+uv run hf download dgrachev/a2_pretrained --repo-type model --local-dir ~/.cache/a2_pretrained
 ```
 
 ### Running the Benchmark

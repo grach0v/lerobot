@@ -76,13 +76,14 @@ dependencies = [
     "pyserial>=3.5,<4.0",
     "wandb>=0.20.0,<0.22.0", # TODO: Bumb dependency (compatible with protobuf)
 
-    "torch>=2.2.1,<2.8.0", # TODO: Bumb dependency
+    "torch>=2.7.1,<2.8.0", # TODO: Bumb dependency
     "torchcodec>=0.2.1,<0.6.0; sys_platform != 'win32' and (sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')) and (sys_platform != 'darwin' or platform_machine != 'x86_64')", # TODO: Bumb dependency
-    "torchvision>=0.21.0,<0.23.0", # TODO: Bumb dependency
+    "torchvision>=0.22.1,<0.23.0", # TODO: Bumb dependency
 
     "draccus==0.10.0", # TODO: Remove ==
     "gymnasium>=1.1.1,<2.0.0",
     "rerun-sdk>=0.24.0,<0.27.0",
+    "numpy>=1.23.5,<2.3.0",
 
     # Support dependencies
     "deepdiff>=7.0.1,<9.0.0",
@@ -163,7 +164,6 @@ a2 = [
     "open3d>=0.17.0",
     "scipy>=1.10.0",
     "graspnetAPI>=1.2.11",
-    "lerobot-policy-a2 @ file:///home/dgrachev/git/A2_lerobot/lerobot_policy_a2",
 ]
 
 # All
@@ -487,4 +487,17 @@ conflicts = [
         { extra = "pi" },
         { extra = "all" },
     ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

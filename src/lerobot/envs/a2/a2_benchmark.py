@@ -17,9 +17,9 @@ import json
 import os
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -38,8 +38,8 @@ class GraspPlacePolicy(Protocol):
         depth_images: dict[str, np.ndarray],
         point_cloud: np.ndarray,
         lang_goal: str,
-        candidate_poses: Optional[np.ndarray] = None,
-        **kwargs
+        candidate_poses: np.ndarray | None = None,
+        **kwargs,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         """Select grasp action. Returns (7D pose, info dict)."""
         ...
@@ -50,9 +50,9 @@ class GraspPlacePolicy(Protocol):
         depth_images: dict[str, np.ndarray],
         point_cloud: np.ndarray,
         lang_goal: str,
-        candidate_poses: Optional[np.ndarray] = None,
-        grasped_object_id: Optional[int] = None,
-        **kwargs
+        candidate_poses: np.ndarray | None = None,
+        grasped_object_id: int | None = None,
+        **kwargs,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         """Select place action. Returns (7D pose, info dict)."""
         ...
@@ -61,6 +61,7 @@ class GraspPlacePolicy(Protocol):
 @dataclass
 class BenchmarkResult:
     """Results from a benchmark evaluation."""
+
     task: str
     object_set: str
     test_case: str
@@ -87,10 +88,11 @@ class BenchmarkResult:
 @dataclass
 class BenchmarkConfig:
     """Configuration for benchmark evaluation."""
+
     task: str = "grasp"  # grasp, place, pickplace
     object_set: str = "train"  # train, test
     testing_case_dir: str = ""  # Auto-detected from task/object_set if empty
-    testing_case: Optional[str] = None  # Specific test case, or None for all
+    testing_case: str | None = None  # Specific test case, or None for all
     num_episodes: int = 15
     max_steps: int = 8
     seed: int = 1234
@@ -103,6 +105,7 @@ class BenchmarkConfig:
         """Auto-detect testing_case_dir if not provided."""
         if not self.testing_case_dir:
             from .a2 import get_testing_cases_path
+
             self.testing_case_dir = str(get_testing_cases_path(self.task, self.object_set))
 
 
@@ -117,7 +120,7 @@ class A2Benchmark:
         self,
         policy: GraspPlacePolicy,
         config: BenchmarkConfig,
-        action_generator: Optional[Callable] = None,
+        action_generator: Callable | None = None,
     ):
         """Initialize benchmark.
 
@@ -134,6 +137,7 @@ class A2Benchmark:
 
         # Initialize environment
         from .a2_sim import Environment
+
         self.env = Environment(gui=config.gui, object_set=config.object_set)
         self.env.seed(config.seed)
 
@@ -241,15 +245,17 @@ class A2Benchmark:
             successes.append(episode_success)
             steps_list.append(steps)
             rewards_list.append(episode_reward)
-            episode_results.append({
-                "episode": episode,
-                "success": episode_success,
-                "steps": steps,
-                "reward": episode_reward,
-            })
+            episode_results.append(
+                {
+                    "episode": episode,
+                    "success": episode_success,
+                    "steps": steps,
+                    "reward": episode_reward,
+                }
+            )
 
         # Compute metrics
-        success_steps = [s for s, succ in zip(steps_list, successes) if succ]
+        success_steps = [s for s, succ in zip(steps_list, successes, strict=False) if succ]
 
         return BenchmarkResult(
             task="grasp",
@@ -308,13 +314,16 @@ class A2Benchmark:
                     candidate_poses=candidate_poses,
                 )
 
-                # For place evaluation, we check if the pose is valid
-                # (actual execution may not be needed for benchmark)
-                pose = (tuple(action[:3]), tuple(action[3:7]))
+                # For place evaluation, we check if the selected pose is valid
+                # based on the spatial relationship to the reference object.
+                # The policy returns "place_valid" in info dict indicating if the
+                # selected action is in the valid_places_list (matching original A2).
+                place_success = info.get("place_valid", False)
 
-                # Check if place is valid using environment's place validation
-                # This is a simplified check - actual implementation depends on task
-                place_success = self._validate_place(pose)
+                # Fallback to workspace check only if policy doesn't provide validity
+                if "place_valid" not in info:
+                    pose = (tuple(action[:3]), tuple(action[3:7]))
+                    place_success = self._validate_place(pose)
 
                 reward = 1.0 if place_success else 0.0
                 episode_reward += reward
@@ -329,14 +338,16 @@ class A2Benchmark:
             successes.append(episode_success)
             steps_list.append(steps)
             rewards_list.append(episode_reward)
-            episode_results.append({
-                "episode": episode,
-                "success": episode_success,
-                "steps": steps,
-                "reward": episode_reward,
-            })
+            episode_results.append(
+                {
+                    "episode": episode,
+                    "success": episode_success,
+                    "steps": steps,
+                    "reward": episode_reward,
+                }
+            )
 
-        success_steps = [s for s, succ in zip(steps_list, successes) if succ]
+        success_steps = [s for s, succ in zip(steps_list, successes, strict=False) if succ]
 
         return BenchmarkResult(
             task="place",
@@ -378,7 +389,7 @@ class A2Benchmark:
             steps = 0
 
             # Grasp phase
-            for step in range(self.config.max_steps):
+            for _step in range(self.config.max_steps):
                 if not self._check_targets_in_workspace():
                     break
 
@@ -412,9 +423,7 @@ class A2Benchmark:
             # Place phase (only if grasp succeeded)
             if grasp_success:
                 # Load place scene
-                _, _, place_lang = self.env.add_object_push_from_pickplace_file(
-                    test_case_path, mode="place"
-                )
+                _, _, place_lang = self.env.add_object_push_from_pickplace_file(test_case_path, mode="place")
                 print(f"    Place: {place_lang}")
 
                 obs = self.get_observations()
@@ -431,8 +440,13 @@ class A2Benchmark:
                     grasped_object_id=grasped_id,
                 )
 
-                pose = (tuple(action[:3]), tuple(action[3:7]))
-                place_success = self._validate_place(pose)
+                # Check if place selection is valid based on spatial relationship
+                place_success = info.get("place_valid", False)
+
+                # Fallback to workspace check only if policy doesn't provide validity
+                if "place_valid" not in info:
+                    pose = (tuple(action[:3]), tuple(action[3:7]))
+                    place_success = self._validate_place(pose)
 
                 if place_success:
                     episode_reward += 2.0
@@ -443,18 +457,20 @@ class A2Benchmark:
             place_successes.append(place_success)
             steps_list.append(steps)
             rewards_list.append(episode_reward)
-            episode_results.append({
-                "episode": episode,
-                "success": episode_success,
-                "grasp_success": grasp_success,
-                "place_success": place_success,
-                "steps": steps,
-                "reward": episode_reward,
-            })
+            episode_results.append(
+                {
+                    "episode": episode,
+                    "success": episode_success,
+                    "grasp_success": grasp_success,
+                    "place_success": place_success,
+                    "steps": steps,
+                    "reward": episode_reward,
+                }
+            )
 
             print(f"    Result: grasp={grasp_success}, place={place_success}")
 
-        success_steps = [s for s, succ in zip(steps_list, successes) if succ]
+        success_steps = [s for s, succ in zip(steps_list, successes, strict=False) if succ]
 
         result = BenchmarkResult(
             task="pickplace",
@@ -480,11 +496,13 @@ class A2Benchmark:
         if self.config.testing_case:
             test_cases = [os.path.join(self.config.testing_case_dir, self.config.testing_case)]
         else:
-            test_cases = sorted([
-                os.path.join(self.config.testing_case_dir, f)
-                for f in os.listdir(self.config.testing_case_dir)
-                if f.endswith(".txt")
-            ])
+            test_cases = sorted(
+                [
+                    os.path.join(self.config.testing_case_dir, f)
+                    for f in os.listdir(self.config.testing_case_dir)
+                    if f.endswith(".txt")
+                ]
+            )
 
         print(f"Running benchmark: task={self.config.task}, object_set={self.config.object_set}")
         print(f"Test cases: {len(test_cases)}")
@@ -512,27 +530,42 @@ class A2Benchmark:
         self.results = results
         return results
 
-    def _check_targets_in_workspace(self) -> bool:
-        """Check if target objects are still in workspace."""
+    def _check_objects_in_workspace(self, obj_ids: list[int]) -> bool:
+        """Check if all specified objects are within workspace bounds.
+
+        Args:
+            obj_ids: List of object IDs to check
+
+        Returns:
+            True if all objects are in workspace, False otherwise
+        """
         from .a2_constants import WORKSPACE_LIMITS
 
-        for obj_id in self.env.target_obj_ids:
+        for obj_id in obj_ids:
             pos, _, _ = self.env.obj_info(obj_id)
-            if (pos[0] < WORKSPACE_LIMITS[0, 0] or pos[0] > WORKSPACE_LIMITS[0, 1] or
-                pos[1] < WORKSPACE_LIMITS[1, 0] or pos[1] > WORKSPACE_LIMITS[1, 1]):
+            if not (
+                WORKSPACE_LIMITS[0, 0] <= pos[0] <= WORKSPACE_LIMITS[0, 1]
+                and WORKSPACE_LIMITS[1, 0] <= pos[1] <= WORKSPACE_LIMITS[1, 1]
+            ):
                 return False
         return True
+
+    def _check_targets_in_workspace(self) -> bool:
+        """Check if target objects are still in workspace."""
+        return self._check_objects_in_workspace(self.env.target_obj_ids)
 
     def _check_references_in_workspace(self) -> bool:
         """Check if reference objects are still in workspace."""
+        return self._check_objects_in_workspace(getattr(self.env, "reference_obj_ids", []))
+
+    def _is_position_in_workspace(self, pos: tuple | list | np.ndarray) -> bool:
+        """Check if a position is within workspace bounds."""
         from .a2_constants import WORKSPACE_LIMITS
 
-        for obj_id in getattr(self.env, 'reference_obj_ids', []):
-            pos, _, _ = self.env.obj_info(obj_id)
-            if (pos[0] < WORKSPACE_LIMITS[0, 0] or pos[0] > WORKSPACE_LIMITS[0, 1] or
-                pos[1] < WORKSPACE_LIMITS[1, 0] or pos[1] > WORKSPACE_LIMITS[1, 1]):
-                return False
-        return True
+        return (
+            WORKSPACE_LIMITS[0, 0] <= pos[0] <= WORKSPACE_LIMITS[0, 1]
+            and WORKSPACE_LIMITS[1, 0] <= pos[1] <= WORKSPACE_LIMITS[1, 1]
+        )
 
     def _validate_place(self, pose: tuple) -> bool:
         """Validate if a place pose is correct.
@@ -540,12 +573,7 @@ class A2Benchmark:
         This is a simplified validation. In practice, you'd check against
         the ground truth valid place regions.
         """
-        # For now, just check if pose is in workspace
-        from .a2_constants import WORKSPACE_LIMITS
-
-        pos = pose[0]
-        return (WORKSPACE_LIMITS[0, 0] <= pos[0] <= WORKSPACE_LIMITS[0, 1] and
-                WORKSPACE_LIMITS[1, 0] <= pos[1] <= WORKSPACE_LIMITS[1, 1])
+        return self._is_position_in_workspace(pose[0])
 
     def _save_results(self, results: list[BenchmarkResult]):
         """Save benchmark results to file."""
@@ -575,12 +603,9 @@ class A2Benchmark:
 def parse_args():
     parser = argparse.ArgumentParser(description="A2 Benchmark Evaluation")
 
-    parser.add_argument("--task", type=str, default="grasp",
-                       choices=["grasp", "place", "pickplace"])
-    parser.add_argument("--object_set", type=str, default="train",
-                       choices=["train", "test"])
-    parser.add_argument("--testing_case_dir", type=str,
-                       default="testing_cases/grasp_testing_cases/seen")
+    parser.add_argument("--task", type=str, default="grasp", choices=["grasp", "place", "pickplace"])
+    parser.add_argument("--object_set", type=str, default="train", choices=["train", "test"])
+    parser.add_argument("--testing_case_dir", type=str, default="testing_cases/grasp_testing_cases/seen")
     parser.add_argument("--testing_case", type=str, default=None)
     parser.add_argument("--num_episodes", type=int, default=15)
     parser.add_argument("--max_steps", type=int, default=8)
@@ -589,11 +614,11 @@ def parse_args():
     parser.add_argument("--results_dir", type=str, default="benchmark_results")
 
     # Policy arguments
-    parser.add_argument("--policy", type=str, default="random",
-                       choices=["random", "a2", "custom"])
+    parser.add_argument("--policy", type=str, default="random", choices=["random", "a2", "custom"])
     parser.add_argument("--model_path", type=str, default="")
-    parser.add_argument("--hf_repo", type=str, default="",
-                       help="HuggingFace repo ID (e.g., dgrachev/a2_pretrained)")
+    parser.add_argument(
+        "--hf_repo", type=str, default="", help="HuggingFace repo ID (e.g., dgrachev/a2_pretrained)"
+    )
     parser.add_argument("--device", type=str, default="cuda")
 
     return parser.parse_args()
@@ -623,20 +648,18 @@ def main():
     # Create policy
     if args.policy == "random":
         from .a2_collect import RandomPolicy
+
         policy = RandomPolicy(device=args.device)
     elif args.policy == "a2":
         from .a2_collect import create_a2_policy
-        policy = create_a2_policy(
-            model_path=args.model_path,
-            hf_repo=args.hf_repo,
-            device=args.device
-        )
+
+        policy = create_a2_policy(model_path=args.model_path, hf_repo=args.hf_repo, device=args.device)
     else:
         raise ValueError(f"Unknown policy: {args.policy}")
 
     # Run benchmark
     benchmark = A2Benchmark(policy=policy, config=config)
-    results = benchmark.run()
+    benchmark.run()
 
 
 if __name__ == "__main__":

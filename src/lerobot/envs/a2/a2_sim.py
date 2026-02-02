@@ -4,25 +4,31 @@ This module provides the Environment class for tabletop manipulation simulation
 with UR5e robot and Robotiq gripper, supporting both train and test object sets.
 """
 
+from __future__ import annotations
+
 import datetime
 import glob
+import hashlib
+import logging
 import os
 import time
+
+logger = logging.getLogger(__name__)
 
 # EGL setup for headless GPU rendering
 # Only set PYOPENGL_PLATFORM - let PyBullet/EGL handle device selection
 # Can be disabled via A2_DISABLE_EGL=true environment variable
-if os.environ.get('A2_DISABLE_EGL', '').lower() != 'true':
-    if 'PYOPENGL_PLATFORM' not in os.environ:
-        os.environ['PYOPENGL_PLATFORM'] = 'egl'
+if os.environ.get("A2_DISABLE_EGL", "").lower() != "true" and "PYOPENGL_PLATFORM" not in os.environ:
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+
+import contextlib
 
 import numpy as np
 import pybullet as pb
 import pybullet_data
 from scipy.spatial.transform import Rotation as R
 
-from . import a2_cameras as cameras
-from . import a2_utils as utils
+from . import a2_cameras as cameras, a2_utils as utils
 from .a2_constants import (
     # Train object constants
     ALL_LABEL,
@@ -30,6 +36,7 @@ from .a2_constants import (
     COLOR_SHAPE,
     FUNCTION,
     GENERAL_LABEL,
+    IMAGE_SIZE,
     KEYWORD_DIR_MAP,
     LABEL,
     LABEL_DIR_MAP,
@@ -40,7 +47,6 @@ from .a2_constants import (
     UNSEEN_FUNCTION,
     UNSEEN_GENERAL_LABEL,
     UNSEEN_KEYWORD_DIR_MAP,
-    UNSEEN_KEYWORD_DIR_MAP_PLACE,
     UNSEEN_LABEL,
     UNSEEN_LABEL_DIR_MAP,
     WORKSPACE_LIMITS,
@@ -55,14 +61,14 @@ class Environment:
 
     # Camera name to index mapping
     CAMERA_INDICES = {
-        'front': 0,
-        'left': 1,
-        'right': 2,
-        'top': 3,        # new_front - top-down view
-        'side_left': 4,  # new_left
-        'side_right': 5, # new_right
-        'overview': 6,   # overview - sees robot and scene
-        'gripper': -1,   # special: dynamic camera attached to gripper
+        "front": 0,
+        "left": 1,
+        "right": 2,
+        "top": 3,  # new_front - top-down view
+        "side_left": 4,  # new_left
+        "side_right": 5,  # new_right
+        "overview": 6,  # overview - sees robot and scene
+        "gripper": -1,  # special: dynamic camera attached to gripper
     }
 
     def __init__(self, gui=True, time_step=1 / 240, object_set="train"):
@@ -76,6 +82,7 @@ class Environment:
         self.time_step = time_step
         self.gui = gui
         self.object_set = object_set
+        self._allow_untextured = os.environ.get("A2_ALLOW_UNTEXTURED", "true").lower() == "true"
         self.pixel_size = PIXEL_SIZE
         self.case_dir = "cases/"
         os.makedirs(self.case_dir, exist_ok=True)  # Ensure case directory exists
@@ -94,8 +101,13 @@ class Environment:
         self.drop_joints0 = np.array([-0.5, -0.5, 0.5, -0.5, -0.5, 0]) * np.pi
         self.drop_joints1 = np.array([1, -0.5, 0.5, -0.5, -0.5, 0]) * np.pi
 
+        # Oracle grasp state
+        self._oracle_grasp_constraint = None
+        self._oracle_grasp_obj_id = None
+
         # Get the actual asset path (downloaded from HuggingFace)
         from .a2 import get_a2_assets_path
+
         self._assets_root = str(get_a2_assets_path())
 
         # Set object-set-specific constants
@@ -123,26 +135,30 @@ class Environment:
 
         # Load EGL plugin for GPU rendering in headless mode
         self._egl_plugin = -1
-        if not gui and os.environ.get('A2_DISABLE_EGL', '').lower() != 'true':
+        if not gui and os.environ.get("A2_DISABLE_EGL", "").lower() != "true":
             import sys
+
             pybullet_dir = os.path.dirname(pb.__file__)
             # Build expected filename based on current Python version
             py_version = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
             egl_candidates = [
-                os.path.join(pybullet_dir, f'eglRenderer.{py_version}-x86_64-linux-gnu.so'),
-                os.path.join(pybullet_dir, 'eglRenderer.cpython-310-x86_64-linux-gnu.so'),
+                os.path.join(pybullet_dir, f"eglRenderer.{py_version}-x86_64-linux-gnu.so"),
+                os.path.join(pybullet_dir, "eglRenderer.cpython-310-x86_64-linux-gnu.so"),
             ]
             for egl_path in egl_candidates:
                 if os.path.exists(egl_path):
-                    self._egl_plugin = pb.loadPlugin(egl_path, '_eglRendererPlugin')
+                    self._egl_plugin = pb.loadPlugin(egl_path, "_eglRendererPlugin")
                     if self._egl_plugin >= 0:
-                        print(f"GPU rendering enabled via EGL (plugin {self._egl_plugin})")
+                        logger.info("GPU rendering enabled via EGL (plugin %d)", self._egl_plugin)
                         break
 
         if gui:
             target = pb.getDebugVisualizerCamera()[11]
             pb.resetDebugVisualizerCamera(
-                cameraDistance=1.5, cameraYaw=90, cameraPitch=-25, cameraTargetPosition=target,
+                cameraDistance=1.5,
+                cameraYaw=90,
+                cameraPitch=-25,
+                cameraTargetPosition=target,
             )
 
         # VLA frame recording state
@@ -173,56 +189,91 @@ class Environment:
         info = {}  # object id : (position, rotation, dimensions)
         for obj_ids in self.obj_ids.values():
             for obj_id in obj_ids:
-                pos, rot = pb.getBasePositionAndOrientation(
-                    obj_id, physicsClientId=self._client_id
-                )
+                pos, rot = pb.getBasePositionAndOrientation(obj_id, physicsClientId=self._client_id)
                 dim = pb.getVisualShapeData(obj_id, physicsClientId=self._client_id)[0][3]
                 info[obj_id] = (pos, rot, dim)
         return info
 
     def obj_info(self, obj_id):
-        """Get object pose and dimensions."""
-        pos, rot = pb.getBasePositionAndOrientation(
-            obj_id, physicsClientId=self._client_id
-        )
-        dim = pb.getVisualShapeData(obj_id, physicsClientId=self._client_id)[0][3]
+        """Get object pose and dimensions (actual bounding box size).
+
+        Returns:
+            Tuple of (position, orientation, dimensions)
+            - position: (x, y, z) world coordinates
+            - orientation: quaternion (x, y, z, w)
+            - dimensions: (width, depth, height) actual bounding box size
+        """
+        pos, rot = pb.getBasePositionAndOrientation(obj_id, physicsClientId=self._client_id)
+
+        # Try to get actual bounding box size from AABB
+        try:
+            aabb_min, aabb_max = pb.getAABB(obj_id, physicsClientId=self._client_id)
+            dim = (
+                aabb_max[0] - aabb_min[0],  # width (x)
+                aabb_max[1] - aabb_min[1],  # depth (y)
+                aabb_max[2] - aabb_min[2],  # height (z)
+            )
+        except Exception:
+            # Fallback to visual shape data (which might be mesh scale)
+            visual_data = pb.getVisualShapeData(obj_id, physicsClientId=self._client_id)
+            if visual_data:
+                dim = visual_data[0][3]
+            else:
+                dim = (0.05, 0.05, 0.05)  # Default small size
+
         return (pos, rot, dim)
 
-    def _load_texture_for_object(self, body_id, mesh_file):
-        """Load and apply texture for an object from its URDF path.
-
-        Only applies to train objects (simplified_objects).
-        """
-        if self.object_set != "train":
-            return  # Unseen objects don't have textures
-
-        obj_dir = mesh_file.replace('.urdf', '')
+    def _find_texture_path(self, mesh_file: str) -> str | None:
+        obj_dir = mesh_file.replace(".urdf", "")
         texture_candidates = [
-            os.path.join(obj_dir, 'texture_map.png'),
-            os.path.join(obj_dir, 'textured.png'),
-            os.path.join(obj_dir, 'dummy.png'),
-            os.path.join(obj_dir, 'texture_map.jpg'),
-            os.path.join(obj_dir, 'textured.jpg'),
-            os.path.join(obj_dir, 'textured_map.jpg'),
+            os.path.join(obj_dir, "texture_map.png"),
+            os.path.join(obj_dir, "textured.png"),
+            os.path.join(obj_dir, "dummy.png"),
+            os.path.join(obj_dir, "texture_map.jpg"),
+            os.path.join(obj_dir, "textured.jpg"),
+            os.path.join(obj_dir, "textured_map.jpg"),
         ]
 
-        texture_path = None
         for candidate in texture_candidates:
             if os.path.exists(candidate):
-                texture_path = candidate
-                break
+                return candidate
 
-        if texture_path is not None:
-            try:
-                texture_id = pb.loadTexture(texture_path, physicsClientId=self._client_id)
-                if texture_id >= 0:
-                    pb.changeVisualShape(
-                        body_id, -1,
-                        textureUniqueId=texture_id,
-                        physicsClientId=self._client_id
-                    )
-            except Exception as e:
-                print(f"Warning: Failed to load texture {texture_path}: {e}")
+        return None
+
+    def _apply_fallback_color(self, body_id: int, mesh_file: str) -> None:
+        digest = hashlib.md5(mesh_file.encode("utf-8")).digest()
+        channels = [(digest[i] / 255.0) for i in range(3)]
+        color = [0.2 + 0.6 * c for c in channels] + [1.0]
+        pb.changeVisualShape(body_id, -1, rgbaColor=color, physicsClientId=self._client_id)
+
+    def _is_valid_mesh_file(self, mesh_file: str) -> bool:
+        obj_dir = mesh_file.replace(".urdf", "")
+        return os.path.isdir(obj_dir)
+
+    def _filter_mesh_list(self, mesh_list: list[str], require_textures: bool = True) -> list[str]:
+        valid_meshes = [mesh_file for mesh_file in mesh_list if self._is_valid_mesh_file(mesh_file)]
+        if not require_textures:
+            return valid_meshes
+
+        textured_meshes = [
+            mesh_file for mesh_file in valid_meshes if self._find_texture_path(mesh_file) is not None
+        ]
+        return textured_meshes or valid_meshes
+
+    def _load_texture_for_object(self, body_id, mesh_file):
+        """Load and apply texture for an object from its URDF path."""
+        texture_path = self._find_texture_path(mesh_file)
+
+        if texture_path is None:
+            self._apply_fallback_color(body_id, mesh_file)
+            return
+
+        try:
+            texture_id = pb.loadTexture(texture_path, physicsClientId=self._client_id)
+            if texture_id >= 0:
+                pb.changeVisualShape(body_id, -1, textureUniqueId=texture_id, physicsClientId=self._client_id)
+        except Exception as e:
+            logger.warning("Failed to load texture %s: %s", texture_path, e)
 
     def generate_lang_goal(self):
         """Generate a language goal for grasp task."""
@@ -257,7 +308,9 @@ class Environment:
                 self.target_obj_lst = self.target_obj_dir
 
         self.lang_goal = LANG_TEMPLATES[template_id].format(keyword=keyword)
-        pb.addUserDebugText(text=self.lang_goal, textPosition=[0.8, -0.2, 0], textColorRGB=[0, 0, 1], textSize=2)
+        pb.addUserDebugText(
+            text=self.lang_goal, textPosition=[0.8, -0.2, 0], textColorRGB=[0, 0, 1], textSize=2
+        )
 
         return self.lang_goal
 
@@ -265,30 +318,44 @@ class Environment:
         """Generate a language goal for place task."""
         if self.object_set == "train":
             self.lang_goal, ref_obj_ids, ref_obj_centers, ref_regions, valid_mask = utils.generate_place_inst(
-                self.obj_labels, self.obj_dirs, obj_bbox_ids, obj_bbox_centers, obj_bbox_sizes, self.pixel_size
+                self.obj_labels,
+                self.obj_dirs,
+                obj_bbox_ids,
+                obj_bbox_centers,
+                obj_bbox_sizes,
+                self.pixel_size,
             )
         else:
-            self.lang_goal, ref_obj_ids, ref_obj_centers, ref_regions, valid_mask = utils.generate_unseen_place_inst(
-                self.obj_labels, self.obj_dirs, obj_bbox_ids, obj_bbox_centers, obj_bbox_sizes, self.pixel_size
+            self.lang_goal, ref_obj_ids, ref_obj_centers, ref_regions, valid_mask = (
+                utils.generate_unseen_place_inst(
+                    self.obj_labels,
+                    self.obj_dirs,
+                    obj_bbox_ids,
+                    obj_bbox_centers,
+                    obj_bbox_sizes,
+                    self.pixel_size,
+                )
             )
 
-        self.reference_obj_ids = ref_obj_ids
+        self.reference_obj_ids = ref_obj_ids if ref_obj_ids is not None else []
 
         if self.lang_goal is not None:
             obj_name = self.obj_labels[ref_obj_ids[0]][0]
             dir_phrase = ref_regions[0]
 
             if not pp_file:
-                with open(self.case_dir + self.test_file_name, "r") as file:
+                with open(self.case_dir + self.test_file_name) as file:
                     current_content = file.read()
                 new_content = self.lang_goal + "\n" + obj_name + "\n" + dir_phrase + "\n" + current_content
                 with open(self.case_dir + self.test_file_name, "w") as file:
                     file.write(new_content)
             else:
-                with open(self.case_dir + self.test_file_name, "r") as file:
+                with open(self.case_dir + self.test_file_name) as file:
                     current_content = file.readlines()
                 insert_line_number = 17
-                current_content.insert(insert_line_number, self.lang_goal + "\n" + obj_name + "\n" + dir_phrase + "\n")
+                current_content.insert(
+                    insert_line_number, self.lang_goal + "\n" + obj_name + "\n" + dir_phrase + "\n"
+                )
                 with open(self.case_dir + self.test_file_name, "w") as file:
                     file.writelines(current_content)
 
@@ -346,7 +413,7 @@ class Environment:
             if self.is_static:
                 return True
             pb.stepSimulation()
-        print(f"Warning: Wait static exceeded {timeout} second timeout. Skipping.")
+        logger.warning("Wait static exceeded %d second timeout. Skipping.", timeout)
         return False
 
     def reset(self, workspace="raw"):
@@ -356,6 +423,9 @@ class Environment:
         self.reference_obj_ids = []
         self.obj_labels = {}
         self.obj_dirs = {}
+
+        if self._oracle_grasp_constraint is not None:
+            self.release_oracle_grasp()
 
         # Temporarily disable VLA recording during reset
         saved_recorder = self._frame_recorder
@@ -370,32 +440,48 @@ class Environment:
 
         # Load workspace
         self.plane = pb.loadURDF(
-            "plane.urdf", basePosition=(0, 0, -0.0005), useFixedBase=True,
+            "plane.urdf",
+            basePosition=(0, 0, -0.0005),
+            useFixedBase=True,
         )
         if workspace == "raw":
             workspace_urdf = os.path.join(self._assets_root, "workspace/workspace.urdf")
             self.workspace = pb.loadURDF(
-                workspace_urdf, basePosition=(0.5, 0, 0), useFixedBase=True,
+                workspace_urdf,
+                basePosition=(0.5, 0, 0),
+                useFixedBase=True,
             )
         elif workspace == "extend":
             workspace_urdf = os.path.join(self._assets_root, "workspace/pp_workspace.urdf")
             self.workspace = pb.loadURDF(
-                workspace_urdf, basePosition=(0.5, 0, 0), useFixedBase=True,
+                workspace_urdf,
+                basePosition=(0.5, 0, 0),
+                useFixedBase=True,
             )
 
         pb.changeDynamics(
-            self.plane, -1,
-            lateralFriction=1.1, restitution=0.5, linearDamping=0.5, angularDamping=0.5,
+            self.plane,
+            -1,
+            lateralFriction=1.1,
+            restitution=0.5,
+            linearDamping=0.5,
+            angularDamping=0.5,
         )
         pb.changeDynamics(
-            self.workspace, -1,
-            lateralFriction=1.1, restitution=0.5, linearDamping=0.5, angularDamping=0.5,
+            self.workspace,
+            -1,
+            lateralFriction=1.1,
+            restitution=0.5,
+            linearDamping=0.5,
+            angularDamping=0.5,
         )
 
         # Load UR5e
         ur5e_urdf = os.path.join(self._assets_root, "ur5e/ur5e.urdf")
         self.ur5e = pb.loadURDF(
-            ur5e_urdf, basePosition=(0, 0, 0), useFixedBase=True,
+            ur5e_urdf,
+            basePosition=(0, 0, 0),
+            useFixedBase=True,
         )
         self.ur5e_joints = []
         for i in range(pb.getNumJoints(self.ur5e)):
@@ -422,17 +508,16 @@ class Environment:
         self.open_gripper()
 
         if not success:
-            print("Simulation is wrong!")
-            exit()
+            raise RuntimeError("Simulation initialization failed: robot home position unreachable")
 
         # Re-enable rendering
         if self.gui:
-            pb.configureDebugVisualizer(
-                pb.COV_ENABLE_RENDERING, 1, physicsClientId=self._client_id
-            )
+            pb.configureDebugVisualizer(pb.COV_ENABLE_RENDERING, 1, physicsClientId=self._client_id)
 
         # Restore VLA recording after reset is complete
         self._frame_recorder = saved_recorder
+        if self._frame_recorder is not None:
+            self.reset_recording_state()
 
     def setup_gripper(self):
         """Load end-effector: gripper"""
@@ -469,7 +554,11 @@ class Environment:
             elif joint_type == pb.JOINT_REVOLUTE:
                 self.gripper_mimic_joints[joint_name] = joint_id
                 pb.setJointMotorControl2(
-                    self.ee, joint_id, pb.VELOCITY_CONTROL, targetVelocity=0, force=0,
+                    self.ee,
+                    joint_id,
+                    pb.VELOCITY_CONTROL,
+                    targetVelocity=0,
+                    force=0,
                 )
 
         self.ee_constraint = pb.createConstraint(
@@ -494,44 +583,64 @@ class Environment:
         """Set up mimic joint constraints for Robotiq gripper."""
         # Left side
         c = pb.createConstraint(
-            self.ee, self.gripper_main_joint,
-            self.ee, self.gripper_mimic_joints["left_inner_finger_joint"],
-            jointType=pb.JOINT_GEAR, jointAxis=[1, 0, 0],
-            parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
+            self.ee,
+            self.gripper_main_joint,
+            self.ee,
+            self.gripper_mimic_joints["left_inner_finger_joint"],
+            jointType=pb.JOINT_GEAR,
+            jointAxis=[1, 0, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=[0, 0, 0],
         )
         pb.changeConstraint(c, gearRatio=1, erp=0.8, maxForce=10000)
 
         c = pb.createConstraint(
-            self.ee, self.gripper_main_joint,
-            self.ee, self.gripper_mimic_joints["left_inner_knuckle_joint"],
-            jointType=pb.JOINT_GEAR, jointAxis=[1, 0, 0],
-            parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
+            self.ee,
+            self.gripper_main_joint,
+            self.ee,
+            self.gripper_mimic_joints["left_inner_knuckle_joint"],
+            jointType=pb.JOINT_GEAR,
+            jointAxis=[1, 0, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=[0, 0, 0],
         )
         pb.changeConstraint(c, gearRatio=-1, erp=0.8, maxForce=10000)
 
         # Right side
         c = pb.createConstraint(
-            self.ee, self.gripper_mimic_joints["right_outer_knuckle_joint"],
-            self.ee, self.gripper_mimic_joints["right_inner_finger_joint"],
-            jointType=pb.JOINT_GEAR, jointAxis=[1, 0, 0],
-            parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
+            self.ee,
+            self.gripper_mimic_joints["right_outer_knuckle_joint"],
+            self.ee,
+            self.gripper_mimic_joints["right_inner_finger_joint"],
+            jointType=pb.JOINT_GEAR,
+            jointAxis=[1, 0, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=[0, 0, 0],
         )
         pb.changeConstraint(c, gearRatio=1, erp=0.8, maxForce=10000)
 
         c = pb.createConstraint(
-            self.ee, self.gripper_mimic_joints["right_outer_knuckle_joint"],
-            self.ee, self.gripper_mimic_joints["right_inner_knuckle_joint"],
-            jointType=pb.JOINT_GEAR, jointAxis=[1, 0, 0],
-            parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
+            self.ee,
+            self.gripper_mimic_joints["right_outer_knuckle_joint"],
+            self.ee,
+            self.gripper_mimic_joints["right_inner_knuckle_joint"],
+            jointType=pb.JOINT_GEAR,
+            jointAxis=[1, 0, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=[0, 0, 0],
         )
         pb.changeConstraint(c, gearRatio=-1, erp=0.8, maxForce=10000)
 
         # Connect left and right
         c = pb.createConstraint(
-            self.ee, self.gripper_main_joint,
-            self.ee, self.gripper_mimic_joints["right_outer_knuckle_joint"],
-            jointType=pb.JOINT_GEAR, jointAxis=[0, 1, 0],
-            parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
+            self.ee,
+            self.gripper_main_joint,
+            self.ee,
+            self.gripper_mimic_joints["right_outer_knuckle_joint"],
+            jointType=pb.JOINT_GEAR,
+            jointAxis=[0, 1, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=[0, 0, 0],
             physicsClientId=self._client_id,
         )
         pb.changeConstraint(c, gearRatio=-1, erp=0.8, maxForce=1000)
@@ -546,10 +655,10 @@ class Environment:
                 done = True
             else:
                 max_pos_dist = np.sqrt(
-                    (self.bounds[0][1]-self.bounds[0][0]) ** 2 +
-                    (self.bounds[1][1]-self.bounds[1][0]) ** 2
+                    (self.bounds[0][1] - self.bounds[0][0]) ** 2
+                    + (self.bounds[1][1] - self.bounds[1][0]) ** 2
                 )
-                reward = - pos_dist / max_pos_dist
+                reward = -pos_dist / max_pos_dist
 
         # Step simulator until objects settle
         while not self.is_static:
@@ -557,18 +666,60 @@ class Environment:
 
         return reward, done
 
-    def step_place(self, place_pose, grasp_pose=None):
+    def oracle_grasp_object(self, obj_id: int) -> None:
+        """Attach an object to the gripper with a fixed constraint."""
+        self.release_oracle_grasp()
+
+        ee_pos, ee_quat = self.get_link_pose(self.ee, self.ee_tip_id)
+        pb.resetBasePositionAndOrientation(obj_id, ee_pos, ee_quat, physicsClientId=self._client_id)
+
+        constraint = pb.createConstraint(
+            parentBodyUniqueId=self.ee,
+            parentLinkIndex=self.ee_tip_id,
+            childBodyUniqueId=obj_id,
+            childLinkIndex=-1,
+            jointType=pb.JOINT_FIXED,
+            jointAxis=(0, 0, 0),
+            parentFramePosition=(0, 0, 0),
+            childFramePosition=(0, 0, 0),
+            physicsClientId=self._client_id,
+        )
+        pb.changeConstraint(constraint, maxForce=10000, physicsClientId=self._client_id)
+
+        self._oracle_grasp_constraint = constraint
+        self._oracle_grasp_obj_id = obj_id
+
+    def release_oracle_grasp(self) -> None:
+        """Release any oracle grasp constraint."""
+        if self._oracle_grasp_constraint is not None:
+            with contextlib.suppress(Exception):
+                pb.removeConstraint(self._oracle_grasp_constraint, physicsClientId=self._client_id)
+        self._oracle_grasp_constraint = None
+        self._oracle_grasp_obj_id = None
+
+    def step_place(
+        self,
+        place_pose,
+        grasp_pose=None,
+        oracle_grasp=False,
+        record_grasp=False,
+        keep_grasp_orientation=False,
+        oracle_place_success=False,
+    ):
         """Execute grasp-then-place for VLA recording."""
-        graspable_ids = [oid for oid in self.obj_ids["rigid"]
-                       if oid not in getattr(self, 'reference_obj_ids', [])]
+        ref_ids = getattr(self, "reference_obj_ids", None) or []
+        graspable_ids = [oid for oid in self.obj_ids["rigid"] if oid not in ref_ids]
         if not graspable_ids:
-            print("Warning: No graspable objects available")
+            logger.warning("No graspable objects available")
             return None, None
 
-        # Disable recording during grasp phase
+        # Disable recording during grasp phase unless requested
         saved_recorder = self._frame_recorder
-        self._frame_recorder = None
+        if not record_grasp:
+            self._frame_recorder = None
         original_target_ids = self.target_obj_ids
+        if original_target_ids is None:
+            original_target_ids = []
 
         grasp_success = False
         grasped_obj_id = None
@@ -577,7 +728,7 @@ class Environment:
             self.target_obj_ids = graspable_ids
             grasp_success, grasped_obj_id, _ = self.grasp(grasp_pose, follow_place=True, detect_force=False)
             if grasp_success and grasped_obj_id is not None:
-                print(f"Successfully grasped object {grasped_obj_id} using graspnet pose")
+                logger.debug("Successfully grasped object %d using graspnet pose", grasped_obj_id)
         else:
             np.random.shuffle(graspable_ids)
             for obj_id in graspable_ids[:5]:
@@ -591,10 +742,12 @@ class Environment:
                 grasp_pos = np.array([obj_pos[0], obj_pos[1], grasp_z])
                 simple_grasp_pose = np.concatenate([grasp_pos, grasp_quat])
 
-                grasp_success, grasped_obj_id, _ = self.grasp(simple_grasp_pose, follow_place=True, detect_force=False)
+                grasp_success, grasped_obj_id, _ = self.grasp(
+                    simple_grasp_pose, follow_place=True, detect_force=False
+                )
 
                 if grasp_success and grasped_obj_id is not None:
-                    print(f"Successfully grasped object {grasped_obj_id}")
+                    logger.debug("Successfully grasped object %d", grasped_obj_id)
                     break
 
                 self.open_gripper()
@@ -602,17 +755,67 @@ class Environment:
 
         self.target_obj_ids = original_target_ids
 
+        if oracle_grasp and not grasp_success:
+            candidate_ids = [oid for oid in original_target_ids if oid in graspable_ids]
+            if not candidate_ids:
+                candidate_ids = graspable_ids
+            if candidate_ids:
+                if grasp_pose is not None:
+                    grasp_pose = np.array(grasp_pose, dtype=np.float32)
+                    rot = grasp_pose[-4:]
+                    pos = grasp_pose[:3]
+                    transform = np.eye(4)
+                    transform[:3, :3] = R.from_quat(rot).as_matrix()
+                    transform[:3, 3] = pos
+
+                    ee_tip_transform = np.array(
+                        [[0, 0, -1, 0], [0, 1, 0, 0], [1, 0, 0, -self.ee_tip_z_offset], [0, 0, 0, 1]]
+                    )
+                    ee_transform = transform @ ee_tip_transform
+                    ee_pos = (ee_transform[:3, 3]).T
+                    ee_pos[2] = max(ee_pos[2] - 0.02, self.bounds[2][0])
+                    over = np.array((ee_pos[0], ee_pos[1], ee_pos[2] + 0.08))
+                    ee_rot = R.from_matrix(ee_transform[:3, :3]).as_quat()
+
+                    self.open_gripper(is_slow=True)
+                    self.move_ee_pose((over, ee_rot))
+                if grasp_pose is not None:
+                    target_xy = grasp_pose[:2]
+                    best_id = candidate_ids[0]
+                    best_dist = None
+                    for obj_id in candidate_ids:
+                        obj_pos, _, _ = self.obj_info(obj_id)
+                        dist = np.linalg.norm(np.array(obj_pos[:2]) - target_xy)
+                        if best_dist is None or dist < best_dist:
+                            best_dist = dist
+                            best_id = obj_id
+                    grasped_obj_id = best_id
+                else:
+                    grasped_obj_id = candidate_ids[0]
+                self.oracle_grasp_object(grasped_obj_id)
+                grasp_success = True
+                logger.debug("Oracle grasped object %d", grasped_obj_id)
+
         if not grasp_success or grasped_obj_id is None:
-            print("Warning: Grasp failed, skipping this episode")
+            logger.warning("Grasp failed, skipping this episode")
             self._frame_recorder = saved_recorder
             self.go_home()
             return None, None
 
-        print(f"Grasped object {grasped_obj_id}, now recording place...")
+        logger.debug("Grasped object %d, now recording place...", grasped_obj_id)
+
+        if keep_grasp_orientation and place_pose is not None:
+            place_pose = np.array(place_pose, dtype=np.float32)
+            _, ee_quat = self.get_link_pose(self.ee, self.ee_tip_id)
+            ee_tip_rot = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]], dtype=np.float32)
+            desired_rot = R.from_quat(ee_quat)
+            pose_rot = desired_rot * R.from_matrix(ee_tip_rot).inv()
+            place_pose[3:7] = pose_rot.as_quat().astype(np.float32)
 
         # Re-enable recording for place phase
         self._frame_recorder = saved_recorder
-        self.reset_recording_state()
+        if not record_grasp:
+            self.reset_recording_state()
 
         place_success = self.place(place_pose)
 
@@ -626,14 +829,40 @@ class Environment:
             distance = np.linalg.norm(obj_xy - target_xy)
 
             actual_success = distance < 0.05
-            print(f"  Place verification: dist={distance:.3f}m, success={actual_success}")
+            logger.debug("Place verification: dist=%.3fm, success=%s", distance, actual_success)
 
             if actual_success:
+                if self._oracle_grasp_constraint is not None:
+                    self.release_oracle_grasp()
                 return 2, True
-            else:
-                return 0, False
-        else:
+            if oracle_place_success and grasped_obj_id is not None:
+                self.release_oracle_grasp()
+                self.open_gripper(is_slow=True)
+                pb.resetBasePositionAndOrientation(
+                    grasped_obj_id,
+                    place_pose[:3],
+                    place_pose[3:7],
+                    physicsClientId=self._client_id,
+                )
+                return 2, True
+            if self._oracle_grasp_constraint is not None:
+                self.release_oracle_grasp()
             return 0, False
+
+        if oracle_place_success and grasped_obj_id is not None:
+            self.release_oracle_grasp()
+            self.open_gripper(is_slow=True)
+            pb.resetBasePositionAndOrientation(
+                grasped_obj_id,
+                place_pose[:3],
+                place_pose[3:7],
+                physicsClientId=self._client_id,
+            )
+            return 2, True
+
+        if self._oracle_grasp_constraint is not None:
+            self.release_oracle_grasp()
+        return 0, False
 
     def seed(self, seed=None):
         self._random = np.random.RandomState(seed)
@@ -674,20 +903,18 @@ class Environment:
         """Get current robot state for recording."""
         ee_pos, ee_quat = self.get_link_pose(self.ur5e, self.ur5e_ee_id)
 
-        joints = np.array([
-            pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0]
-            for i in self.ur5e_joints
-        ], dtype=np.float32)
+        joints = np.array(
+            [pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0] for i in self.ur5e_joints],
+            dtype=np.float32,
+        )
 
-        gripper_angle = pb.getJointState(
-            self.ee, self.gripper_main_joint, physicsClientId=self._client_id
-        )[0]
+        gripper_angle = pb.getJointState(self.ee, self.gripper_main_joint, physicsClientId=self._client_id)[0]
 
         return {
-            'ee_pos': np.array(ee_pos, dtype=np.float32),
-            'ee_quat': np.array(ee_quat, dtype=np.float32),
-            'joints': joints,
-            'gripper_angle': float(gripper_angle)
+            "ee_pos": np.array(ee_pos, dtype=np.float32),
+            "ee_quat": np.array(ee_quat, dtype=np.float32),
+            "joints": joints,
+            "gripper_angle": float(gripper_angle),
         }
 
     def _get_gripper_camera_config(self):
@@ -758,11 +985,11 @@ class Environment:
     def get_camera_images(self, cameras=None, render_size=None):
         """Get RGB images from RealSense cameras."""
         images = {}
-        default_cams = ['front', 'left', 'right']
+        default_cams = ["front", "left", "right"]
         cam_names = cameras if cameras else default_cams
 
         if render_size is None:
-            render_size = getattr(self, '_recording_render_size', None)
+            render_size = getattr(self, "_recording_render_size", None)
 
         for name in cam_names:
             if name not in self.CAMERA_INDICES:
@@ -770,10 +997,7 @@ class Environment:
 
             i = self.CAMERA_INDICES[name]
 
-            if name == 'gripper':
-                config = self._get_gripper_camera_config()
-            else:
-                config = self.agent_cams[i]
+            config = self._get_gripper_camera_config() if name == "gripper" else self.agent_cams[i]
 
             if render_size is not None:
                 color = self.render_camera_fast(config, render_size)
@@ -794,10 +1018,9 @@ class Environment:
         if self._step_counter >= self._steps_per_frame:
             self._step_counter = 0
 
-            current_joints = np.array([
-                pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0]
-                for i in self.ur5e_joints
-            ])
+            current_joints = np.array(
+                [pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0] for i in self.ur5e_joints]
+            )
 
             if self._baseline_joints is None:
                 self._baseline_joints = current_joints.copy()
@@ -858,7 +1081,7 @@ class Environment:
         if config["noise"]:
             depth += self._random.normal(0, 0.003, depth_image_size)
 
-        segm = np.uint8(segm).reshape(depth_image_size)
+        segm = np.asarray(segm, dtype=np.int32).reshape(depth_image_size)
 
         return color, depth, segm
 
@@ -884,7 +1107,7 @@ class Environment:
         colors_dict = {}
         depths_dict = {}
 
-        cam_names = ['front', 'left', 'right', 'new_front', 'new_left', 'new_right', 'overview']
+        cam_names = ["front", "left", "right", "top", "side_left", "side_right", "overview"]
 
         for cam_idx in cameras:
             if cam_idx >= len(self.agent_cams):
@@ -892,7 +1115,7 @@ class Environment:
 
             config = self.agent_cams[cam_idx]
             color, depth, _ = self.render_camera(config)
-            cam_name = cam_names[cam_idx] if cam_idx < len(cam_names) else f'cam{cam_idx}'
+            cam_name = cam_names[cam_idx] if cam_idx < len(cam_names) else f"cam{cam_idx}"
             colors_dict[cam_name] = color
             depths_dict[cam_name] = depth
 
@@ -942,12 +1165,12 @@ class Environment:
 
             # Clip to workspace bounds
             bounds_mask = (
-                (points_world[:, 0] > self.bounds[0, 0]) &
-                (points_world[:, 0] < self.bounds[0, 1]) &
-                (points_world[:, 1] > self.bounds[1, 0]) &
-                (points_world[:, 1] < self.bounds[1, 1]) &
-                (points_world[:, 2] > self.bounds[2, 0]) &
-                (points_world[:, 2] < self.bounds[2, 1])
+                (points_world[:, 0] > self.bounds[0, 0])
+                & (points_world[:, 0] < self.bounds[0, 1])
+                & (points_world[:, 1] > self.bounds[1, 0])
+                & (points_world[:, 1] < self.bounds[1, 1])
+                & (points_world[:, 2] > self.bounds[2, 0])
+                & (points_world[:, 2] < self.bounds[2, 1])
             )
 
             points_clipped = points_world[bounds_mask]
@@ -970,6 +1193,7 @@ class Environment:
             # Downsample
             if downsample and len(merged_pcd.points) > 0:
                 merged_pcd = merged_pcd.voxel_down_sample(voxel_size)
+                merged_pcd, _ = merged_pcd.remove_statistical_outlier(nb_neighbors=5, std_ratio=0.2)
 
         return merged_pcd, colors_dict, depths_dict
 
@@ -1006,14 +1230,12 @@ class Environment:
         if self._client_id is not None and pb is not None:
             try:
                 # Unload EGL plugin first
-                if hasattr(self, '_egl_plugin') and self._egl_plugin >= 0:
-                    try:
+                if hasattr(self, "_egl_plugin") and self._egl_plugin >= 0:
+                    with contextlib.suppress(Exception):
                         pb.unloadPlugin(self._egl_plugin, physicsClientId=self._client_id)
-                    except Exception:
-                        pass
                     self._egl_plugin = -1
                 # Then disconnect
-                if hasattr(pb, 'disconnect'):
+                if hasattr(pb, "disconnect"):
                     pb.disconnect(physicsClientId=self._client_id)
             except Exception:
                 pass
@@ -1030,7 +1252,8 @@ class Environment:
     def add_objects(self, num_obj, workspace_limits, test_data=False):
         """Randomly drop objects to the workspace for grasp task."""
         self.num_obj = num_obj
-        mesh_list = glob.glob(f"{self._asset_dir}/*.urdf")
+        mesh_list_raw = glob.glob(f"{self._asset_dir}/*.urdf")
+        mesh_list = self._filter_mesh_list(mesh_list_raw, require_textures=not self._allow_untextured)
 
         target_mesh_list = []
         for target_obj in self.target_obj_lst:
@@ -1041,7 +1264,17 @@ class Environment:
             if obj_mesh_file in mesh_list:
                 mesh_list.remove(obj_mesh_file)
 
-        obj_mesh_ind = np.random.randint(0, len(mesh_list), size=num_obj-len(self.target_obj_lst))
+        extra_obj_count = max(0, num_obj - len(self.target_obj_lst))
+        if extra_obj_count > 0 and len(mesh_list) < extra_obj_count:
+            mesh_list = self._filter_mesh_list(mesh_list_raw, require_textures=False)
+            for obj in self.target_obj_dir:
+                obj_mesh_file = f"{self._asset_dir}/{obj}.urdf"
+                if obj_mesh_file in mesh_list:
+                    mesh_list.remove(obj_mesh_file)
+        if extra_obj_count > 0:
+            obj_mesh_ind = np.random.randint(0, len(mesh_list), size=extra_obj_count)
+        else:
+            obj_mesh_ind = np.array([], dtype=int)
 
         body_ids = []
         self.target_obj_ids = []
@@ -1054,14 +1287,22 @@ class Environment:
             self.test_file_name = "temp.txt"
 
         with open(self.case_dir + self.test_file_name, "w") as out_file:
-            out_file.write("%s\n" % self.lang_goal)
+            out_file.write(f"{self.lang_goal}\n")
             for i in range(len(target_mesh_list)):
                 out_file.write(f"{i} ")
             out_file.write("\n")
 
-            for idx, target_mesh_file in enumerate(target_mesh_list):
-                drop_x = (workspace_limits[0][1] - workspace_limits[0][0] - 0.2) * np.random.random_sample() + workspace_limits[0][0] + 0.1
-                drop_y = (workspace_limits[1][1] - workspace_limits[1][0] - 0.2) * np.random.random_sample() + workspace_limits[1][0] + 0.1
+            for _idx, target_mesh_file in enumerate(target_mesh_list):
+                drop_x = (
+                    (workspace_limits[0][1] - workspace_limits[0][0] - 0.2) * np.random.random_sample()
+                    + workspace_limits[0][0]
+                    + 0.1
+                )
+                drop_y = (
+                    (workspace_limits[1][1] - workspace_limits[1][0] - 0.2) * np.random.random_sample()
+                    + workspace_limits[1][0]
+                    + 0.1
+                )
                 object_position = [drop_x, drop_y, 0.2]
                 object_orientation = [2 * np.pi * np.random.random_sample() for _ in range(3)]
                 body_id = pb.loadURDF(
@@ -1074,14 +1315,23 @@ class Environment:
                 self.wait_static()
 
                 out_file.write(
-                    "%s %.18e %.18e %.18e %.18e %.18e %.18e\n"
-                    % (target_mesh_file, *object_position, *object_orientation)
+                    "{} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e}\n".format(
+                        target_mesh_file, *object_position, *object_orientation
+                    )
                 )
 
             for object_idx in range(len(obj_mesh_ind)):
                 curr_mesh_file = mesh_list[obj_mesh_ind[object_idx]]
-                drop_x = (workspace_limits[0][1] - workspace_limits[0][0] - 0.2) * np.random.random_sample() + workspace_limits[0][0] + 0.1
-                drop_y = (workspace_limits[1][1] - workspace_limits[1][0] - 0.2) * np.random.random_sample() + workspace_limits[1][0] + 0.1
+                drop_x = (
+                    (workspace_limits[0][1] - workspace_limits[0][0] - 0.2) * np.random.random_sample()
+                    + workspace_limits[0][0]
+                    + 0.1
+                )
+                drop_y = (
+                    (workspace_limits[1][1] - workspace_limits[1][0] - 0.2) * np.random.random_sample()
+                    + workspace_limits[1][0]
+                    + 0.1
+                )
                 object_position = [drop_x, drop_y, 0.2]
                 object_orientation = [2 * np.pi * np.random.random_sample() for _ in range(3)]
                 body_id = pb.loadURDF(
@@ -1093,16 +1343,132 @@ class Environment:
                 self.wait_static()
 
                 out_file.write(
-                    "%s %.18e %.18e %.18e %.18e %.18e %.18e\n"
-                    % (curr_mesh_file, *object_position, *object_orientation)
+                    "{} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e}\n".format(
+                        curr_mesh_file, *object_position, *object_orientation
+                    )
                 )
 
         return body_ids, True
 
+    def add_objects_from_file(self, file_path: str, assets_root: str | None = None) -> tuple[list[int], bool, str]:
+        """Load objects from a predefined test case file.
+
+        File format (matching original A2):
+            Line 1: Language goal
+            Line 2: Target object indices (space-separated, 0-indexed)
+            Lines 3+: Object definitions: urdf_path x y z rx ry rz
+
+        Args:
+            file_path: Path to the test case file
+            assets_root: Root directory for resolving relative asset paths.
+                         If None, tries to find the A2_new directory automatically.
+
+        Returns:
+            body_ids: List of loaded object body IDs
+            success: Whether loading was successful
+            lang_goal: The language goal from the file
+        """
+        body_ids = []
+        self.target_obj_ids = []
+
+        # Determine assets root for resolving relative paths
+        if assets_root is None:
+            # Try to find A2_new directory by looking relative to test case file
+            test_case_dir = os.path.dirname(os.path.abspath(file_path))
+            # Walk up to find the root (testing_cases is typically 2-3 levels deep)
+            for _ in range(5):
+                parent = os.path.dirname(test_case_dir)
+                if os.path.exists(os.path.join(parent, "assets", "simplified_objects")):
+                    assets_root = parent
+                    break
+                test_case_dir = parent
+
+        if assets_root is None:
+            # Fallback: use the test case file's parent directories
+            assets_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(file_path))))
+
+        # Read the test case file
+        with open(file_path, "r") as f:
+            lines = f.readlines()
+
+        if len(lines) < 3:
+            logger.error("Test case file must have at least 3 lines")
+            return body_ids, False, ""
+
+        # Line 1: Language goal
+        lang_goal = lines[0].strip()
+        self.lang_goal = lang_goal
+
+        # Line 2: Target object indices (0-indexed in file)
+        target_indices = [int(i) for i in lines[1].split()]
+
+        # Lines 3+: Object definitions
+        obj_data = []
+        for line in lines[2:]:
+            parts = line.strip().split()
+            if len(parts) >= 7:
+                urdf_path = parts[0]
+                position = [float(parts[1]), float(parts[2]), float(parts[3])]
+                orientation = [float(parts[4]), float(parts[5]), float(parts[6])]
+                obj_data.append((urdf_path, position, orientation))
+
+        # Load objects
+        for obj_idx, (urdf_path, position, orientation) in enumerate(obj_data):
+            # Resolve relative paths
+            if not os.path.isabs(urdf_path):
+                urdf_path = os.path.join(assets_root, urdf_path)
+
+            # Convert orientation from euler angles to quaternion
+            quat = pb.getQuaternionFromEuler(orientation)
+
+            try:
+                body_id = pb.loadURDF(urdf_path, position, quat, flags=pb.URDF_ENABLE_SLEEPING)
+            except Exception as e:
+                logger.warning("Failed to load URDF %s: %s", urdf_path, e)
+                continue
+
+            body_ids.append(body_id)
+            self.add_object_id(body_id)
+            self._load_texture_for_object(body_id, urdf_path)
+            self.wait_static()
+
+            # Check if this is a target object
+            if obj_idx in target_indices:
+                self.target_obj_ids.append(body_id)
+
+            # Add object labels based on directory
+            dir_label = os.path.basename(urdf_path).split(".")[0]
+            self.obj_dirs[body_id] = dir_label
+            self.obj_labels[body_id] = []
+
+            # Check for unique labels
+            if dir_label in ALL_LABEL_DIR_MAP:
+                ind = ALL_LABEL_DIR_MAP.index(dir_label)
+                self.obj_labels[body_id].append(ALL_LABEL[ind])
+
+            # Check for general labels
+            for key, dirs in KEYWORD_DIR_MAP.items():
+                if dir_label in dirs:
+                    self.obj_labels[body_id].append(key)
+                    break
+
+            if not self.obj_labels[body_id]:
+                self.obj_labels.pop(body_id)
+
+        # Let physics settle
+        for _ in range(5):
+            pb.stepSimulation()
+
+        logger.info("Loaded %d objects from %s (targets: %s)", len(body_ids), file_path, self.target_obj_ids)
+        return body_ids, True, lang_goal
+
     def add_objects_for_place(self, num_obj, workspace_limits, test_data=False):
         """Randomly drop objects to the workspace for place task."""
         self.num_obj = num_obj
-        mesh_list = glob.glob(f"{self._asset_dir}/*.urdf")
+        mesh_list_raw = glob.glob(f"{self._asset_dir}/*.urdf")
+        mesh_list = self._filter_mesh_list(mesh_list_raw, require_textures=not self._allow_untextured)
+        if len(mesh_list) < num_obj:
+            mesh_list = self._filter_mesh_list(mesh_list_raw, require_textures=False)
 
         obj_mesh_ind = np.random.randint(0, len(mesh_list), size=num_obj)
 
@@ -1124,7 +1490,7 @@ class Environment:
         with open(self.case_dir + self.test_file_name, "a") as out_file:
             for object_idx in range(len(obj_mesh_ind)):
                 curr_mesh_file = mesh_list[obj_mesh_ind[object_idx]]
-                curr_dir_label = curr_mesh_file.split('/')[-1].split('.')[0]
+                curr_dir_label = curr_mesh_file.split("/")[-1].split(".")[0]
 
                 drop_x, drop_y = drop_xys[object_idx]
                 object_position = [drop_x, drop_y, 0.1]
@@ -1156,11 +1522,39 @@ class Environment:
                     self.obj_labels.pop(body_id)
 
                 out_file.write(
-                    "%s %.18e %.18e %.18e %.18e %.18e %.18e\n"
-                    % (curr_mesh_file, *object_position, *object_orientation)
+                    "{} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e}\n".format(
+                        curr_mesh_file, *object_position, *object_orientation
+                    )
                 )
 
         return body_ids, True
+
+    def get_obj_bboxes_from_aabb(self, obj_ids: list[int] | None = None):
+        """Compute object bounding boxes (pixel coords) from AABB."""
+        if obj_ids is None:
+            obj_ids = list(self.obj_ids.get("rigid", []))
+
+        bbox_ids: list[int] = []
+        bbox_centers: list[tuple[int, int]] = []
+        bbox_sizes: list[tuple[int, int]] = []
+
+        for obj_id in obj_ids:
+            aabb_min, aabb_max = pb.getAABB(obj_id, physicsClientId=self._client_id)
+            cx = (aabb_min[0] + aabb_max[0]) / 2
+            cy = (aabb_min[1] + aabb_max[1]) / 2
+            w = max(1, int((aabb_max[0] - aabb_min[0]) / self.pixel_size))
+            h = max(1, int((aabb_max[1] - aabb_min[1]) / self.pixel_size))
+
+            px = int((cx - self.bounds[0][0]) / self.pixel_size)
+            py = int((cy - self.bounds[1][0]) / self.pixel_size)
+            px = int(np.clip(px, 0, IMAGE_SIZE - 1))
+            py = int(np.clip(py, 0, IMAGE_SIZE - 1))
+
+            bbox_ids.append(obj_id)
+            bbox_centers.append((px, py))
+            bbox_sizes.append((w, h))
+
+        return bbox_ids, bbox_centers, bbox_sizes
 
     def add_object_push_from_file(self, file_name, switch=None):
         """Load objects from a grasp test case file.
@@ -1178,7 +1572,7 @@ class Environment:
             Tuple of (success, lang_goal)
         """
         success = True
-        with open(file_name, "r") as preset_file:
+        with open(file_name) as preset_file:
             file_content = preset_file.readlines()
             self.lang_goal = file_content[0].strip()
             target_obj = file_content[1].split()
@@ -1190,16 +1584,20 @@ class Environment:
             for object_idx in range(num_obj):
                 file_content_curr_object = file_content[object_idx + 2].split()
                 obj_files.append(file_content_curr_object[0])
-                obj_positions.append([
-                    float(file_content_curr_object[1]),
-                    float(file_content_curr_object[2]),
-                    float(file_content_curr_object[3]),
-                ])
-                obj_orientations.append([
-                    float(file_content_curr_object[4]),
-                    float(file_content_curr_object[5]),
-                    float(file_content_curr_object[6]),
-                ])
+                obj_positions.append(
+                    [
+                        float(file_content_curr_object[1]),
+                        float(file_content_curr_object[2]),
+                        float(file_content_curr_object[3]),
+                    ]
+                )
+                obj_orientations.append(
+                    [
+                        float(file_content_curr_object[4]),
+                        float(file_content_curr_object[5]),
+                        float(file_content_curr_object[6]),
+                    ]
+                )
 
         # Import objects
         for object_idx in range(num_obj):
@@ -1215,7 +1613,7 @@ class Environment:
                 curr_mesh_file,
                 object_position,
                 pb.getQuaternionFromEuler(object_orientation),
-                flags=pb.URDF_ENABLE_SLEEPING
+                flags=pb.URDF_ENABLE_SLEEPING,
             )
             self.add_object_id(body_id)
             success &= self.wait_static()
@@ -1245,7 +1643,7 @@ class Environment:
             Tuple of (success, lang_goal)
         """
         success = True
-        with open(file_name, "r") as preset_file:
+        with open(file_name) as preset_file:
             file_content = preset_file.readlines()
             self.lang_goal = file_content[0].strip()
             target_obj_label = file_content[1].strip()
@@ -1258,22 +1656,28 @@ class Environment:
                 file_content_curr_object = file_content[object_idx + 3].split()
                 obj_files.append(file_content_curr_object[0])
                 if not variance:
-                    obj_positions.append([
-                        float(file_content_curr_object[1]),
-                        float(file_content_curr_object[2]),
-                        float(file_content_curr_object[3]),
-                    ])
+                    obj_positions.append(
+                        [
+                            float(file_content_curr_object[1]),
+                            float(file_content_curr_object[2]),
+                            float(file_content_curr_object[3]),
+                        ]
+                    )
                 else:
-                    obj_positions.append([
-                        float(file_content_curr_object[1]) + 0.05 * np.random.uniform(-1, 1),
-                        float(file_content_curr_object[2]) + 0.05 * np.random.uniform(-1, 1),
-                        float(file_content_curr_object[3]),
-                    ])
-                obj_orientations.append([
-                    float(file_content_curr_object[4]),
-                    float(file_content_curr_object[5]),
-                    float(file_content_curr_object[6]),
-                ])
+                    obj_positions.append(
+                        [
+                            float(file_content_curr_object[1]) + 0.05 * np.random.uniform(-1, 1),
+                            float(file_content_curr_object[2]) + 0.05 * np.random.uniform(-1, 1),
+                            float(file_content_curr_object[3]),
+                        ]
+                    )
+                obj_orientations.append(
+                    [
+                        float(file_content_curr_object[4]),
+                        float(file_content_curr_object[5]),
+                        float(file_content_curr_object[6]),
+                    ]
+                )
 
         # Import objects
         self.obj_labels = {}
@@ -1291,7 +1695,7 @@ class Environment:
                 curr_mesh_file,
                 object_position,
                 pb.getQuaternionFromEuler(object_orientation),
-                flags=pb.URDF_ENABLE_SLEEPING
+                flags=pb.URDF_ENABLE_SLEEPING,
             )
             self.add_object_id(body_id)
             success &= self.wait_static()
@@ -1300,7 +1704,7 @@ class Environment:
             self.obj_labels[body_id] = []
 
             # Check if the object is target
-            curr_dir_label = curr_mesh_file.split('/')[-1].split('.')[0]
+            curr_dir_label = curr_mesh_file.split("/")[-1].split(".")[0]
             # For objects that have unique meaningful labels
             if curr_dir_label in ALL_LABEL_DIR_MAP:
                 curr_ind = ALL_LABEL_DIR_MAP.index(curr_dir_label)
@@ -1313,7 +1717,7 @@ class Environment:
                     self.reference_obj_labels.append(target_obj_label)
 
             # For objects that have general meaningful labels
-            for key in self._KEYWORD_DIR_MAP.keys():
+            for key in self._KEYWORD_DIR_MAP:
                 if curr_dir_label in self._KEYWORD_DIR_MAP[key]:
                     self.obj_labels[body_id].append(key)
                     if len(self.obj_labels[body_id]) == 1 and key == target_obj_label:
@@ -1352,11 +1756,10 @@ class Environment:
         place_lang_goal = None
 
         if mode == "grasp":
-            with open(file_name, "r") as preset_file:
+            with open(file_name) as preset_file:
                 file_content = preset_file.readlines()
                 grasp_lang_goal = file_content[0].strip()
-                target_obj = file_content[1].split()
-                self.target_obj_ids = [4 + int(i) for i in target_obj]
+                target_obj_indices = file_content[1].split()  # Parse indices, not IDs
                 grasp_num_obj = 15
                 obj_files = []
                 obj_positions = []
@@ -1364,18 +1767,23 @@ class Environment:
                 for object_idx in range(grasp_num_obj):
                     file_content_curr_object = file_content[object_idx + 2].split()
                     obj_files.append(file_content_curr_object[0])
-                    obj_positions.append([
-                        float(file_content_curr_object[1]),
-                        float(file_content_curr_object[2]),
-                        float(file_content_curr_object[3]),
-                    ])
-                    obj_orientations.append([
-                        float(file_content_curr_object[4]),
-                        float(file_content_curr_object[5]),
-                        float(file_content_curr_object[6]),
-                    ])
+                    obj_positions.append(
+                        [
+                            float(file_content_curr_object[1]),
+                            float(file_content_curr_object[2]),
+                            float(file_content_curr_object[3]),
+                        ]
+                    )
+                    obj_orientations.append(
+                        [
+                            float(file_content_curr_object[4]),
+                            float(file_content_curr_object[5]),
+                            float(file_content_curr_object[6]),
+                        ]
+                    )
 
-            # Import objects
+            # Import objects and track body IDs
+            loaded_body_ids = []
             for object_idx in range(grasp_num_obj):
                 curr_mesh_file = obj_files[object_idx]
                 # Resolve asset path
@@ -1387,17 +1795,22 @@ class Environment:
                     curr_mesh_file,
                     object_position,
                     pb.getQuaternionFromEuler(object_orientation),
-                    flags=pb.URDF_ENABLE_SLEEPING
+                    flags=pb.URDF_ENABLE_SLEEPING,
                 )
                 self.add_object_id(body_id)
+                loaded_body_ids.append(body_id)
                 success &= self.wait_static()
                 success &= self.wait_static()
+
+            # Set target_obj_ids using the actual body IDs from loaded objects
+            # target_obj_indices contains the indices (0-based) of target objects
+            self.target_obj_ids = [loaded_body_ids[int(i)] for i in target_obj_indices if int(i) < len(loaded_body_ids)]
 
             for _ in range(5):
                 pb.stepSimulation()
 
         elif mode == "place":
-            with open(file_name, "r") as preset_file:
+            with open(file_name) as preset_file:
                 file_content = preset_file.readlines()
                 place_lang_goal = file_content[17].strip()
                 target_obj_label = file_content[18].strip()
@@ -1409,16 +1822,20 @@ class Environment:
                 for object_idx in range(place_num_obj):
                     file_content_curr_object = file_content[object_idx + 20].split()
                     obj_files.append(file_content_curr_object[0])
-                    obj_positions.append([
-                        float(file_content_curr_object[1]),
-                        float(file_content_curr_object[2]),
-                        float(file_content_curr_object[3]),
-                    ])
-                    obj_orientations.append([
-                        float(file_content_curr_object[4]),
-                        float(file_content_curr_object[5]),
-                        float(file_content_curr_object[6]),
-                    ])
+                    obj_positions.append(
+                        [
+                            float(file_content_curr_object[1]),
+                            float(file_content_curr_object[2]),
+                            float(file_content_curr_object[3]),
+                        ]
+                    )
+                    obj_orientations.append(
+                        [
+                            float(file_content_curr_object[4]),
+                            float(file_content_curr_object[5]),
+                            float(file_content_curr_object[6]),
+                        ]
+                    )
 
             # Import objects
             self.obj_labels = {}
@@ -1436,7 +1853,7 @@ class Environment:
                     curr_mesh_file,
                     object_position,
                     pb.getQuaternionFromEuler(object_orientation),
-                    flags=pb.URDF_ENABLE_SLEEPING
+                    flags=pb.URDF_ENABLE_SLEEPING,
                 )
                 self.add_object_id(body_id)
                 success &= self.wait_static()
@@ -1445,7 +1862,7 @@ class Environment:
                 self.obj_labels[body_id] = []
 
                 # Check if the object is target
-                curr_dir_label = curr_mesh_file.split('/')[-1].split('.')[0]
+                curr_dir_label = curr_mesh_file.split("/")[-1].split(".")[0]
                 # For objects that have unique meaningful labels
                 if curr_dir_label in ALL_LABEL_DIR_MAP:
                     curr_ind = ALL_LABEL_DIR_MAP.index(curr_dir_label)
@@ -1458,7 +1875,7 @@ class Environment:
                         self.reference_obj_labels.append(target_obj_label)
 
                 # For objects that have general meaningful labels
-                for key in self._KEYWORD_DIR_MAP.keys():
+                for key in self._KEYWORD_DIR_MAP:
                     if curr_dir_label in self._KEYWORD_DIR_MAP[key]:
                         self.obj_labels[body_id].append(key)
                         if len(self.obj_labels[body_id]) == 1 and key == target_obj_label:
@@ -1515,21 +1932,20 @@ class Environment:
     def move_joints(self, target_joints, speed=0.01, timeout=3):
         """Move UR5e to target joint configuration."""
         # Longer timeout when recording (3x) and even longer with CPU rendering (10x)
-        cpu_render = os.environ.get('A2_DISABLE_EGL', '').lower() == 'true'
+        cpu_render = os.environ.get("A2_DISABLE_EGL", "").lower() == "true"
         if self._frame_recorder is not None:
             effective_timeout = timeout * 10 if cpu_render else timeout * 3
         else:
             effective_timeout = timeout * 3 if cpu_render else timeout
         t0 = time.time()
         while (time.time() - t0) < effective_timeout:
-            current_joints = np.array([
-                pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0]
-                for i in self.ur5e_joints
-            ])
+            current_joints = np.array(
+                [pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0] for i in self.ur5e_joints]
+            )
             pos, _ = self.get_link_pose(self.ee, self.ee_tip_id)
 
             if pos[2] < 0.005:
-                print(f"Warning: move_joints tip height is {pos[2]}. Skipping.")
+                logger.warning("move_joints tip height is %.4f. Skipping.", pos[2])
                 return False
 
             diff_joints = target_joints - current_joints
@@ -1552,7 +1968,7 @@ class Environment:
             pb.stepSimulation()
             self._maybe_record_frame()
 
-        print(f"Warning: move_joints exceeded {effective_timeout} second timeout. Skipping.")
+        logger.warning("move_joints exceeded %.1f second timeout. Skipping.", effective_timeout)
         return False
 
     def move_ee_pose(self, pose, speed=0.01):
@@ -1626,7 +2042,7 @@ class Environment:
                 if force > max_force:
                     target = target - vec * 2 * step_distance
                     self.move_ee_pose((target, rot), speed)
-                    print(f"Force is {force}, exceed the max force {max_force}")
+                    logger.debug("Force is %.2f, exceeded max force %.2f", force, max_force)
                     return False
 
         if is_push:
@@ -1636,9 +2052,7 @@ class Environment:
 
     def grasp(self, pose, speed=0.005, follow_place=False, detect_force=True):
         """Execute grasping primitive."""
-        pb.changeDynamics(
-            self.ee, self.ee_finger_pad_id, lateralFriction=0.9, spinningFriction=0.1
-        )
+        pb.changeDynamics(self.ee, self.ee_finger_pad_id, lateralFriction=0.9, spinningFriction=0.1)
 
         pose = np.array(pose, dtype=np.float32)
         rot = pose[-4:]
@@ -1647,12 +2061,9 @@ class Environment:
         transform[:3, :3] = R.from_quat(rot).as_matrix()
         transform[:3, 3] = pos
 
-        ee_tip_transform = np.array([
-            [0, 0, -1, 0],
-            [0, 1, 0, 0],
-            [1, 0, 0, -self.ee_tip_z_offset],
-            [0, 0, 0, 1]
-        ])
+        ee_tip_transform = np.array(
+            [[0, 0, -1, 0], [0, 1, 0, 0], [1, 0, 0, -self.ee_tip_z_offset], [0, 0, 0, 1]]
+        )
 
         ee_transform = transform @ ee_tip_transform
         pos = (ee_transform[:3, 3]).T
@@ -1685,8 +2096,7 @@ class Environment:
                 pos_dists = []
                 for target_obj_id in self.target_obj_ids:
                     pos_dist = np.linalg.norm(
-                        np.array(self.info[grasped_obj_id][0][:2]) -
-                        np.array(self.info[target_obj_id][0][:2])
+                        np.array(self.info[grasped_obj_id][0][:2]) - np.array(self.info[target_obj_id][0][:2])
                     )
                     pos_dists.append(pos_dist)
                 if pos_dists:
@@ -1695,20 +2105,20 @@ class Environment:
         if not success:
             pos_dists = []
             for target_obj_id in self.target_obj_ids:
-                pos_dist = np.linalg.norm(
-                    np.array(pos[:2]) - np.array(self.info[target_obj_id][0][:2])
-                )
+                pos_dist = np.linalg.norm(np.array(pos[:2]) - np.array(self.info[target_obj_id][0][:2]))
                 pos_dists.append(pos_dist)
             if pos_dists:
                 min_pos_dist = min(pos_dists)
 
+        grasp_success = success
         if not follow_place:
             if success:
-                success = self.move_joints(self.drop_joints1)
+                self.move_joints(self.drop_joints1)
                 self.open_gripper(is_slow=True)
             self.go_home()
+        success = grasp_success
 
-        print(f"Grasp at {pose[:3]}, success={success}")
+        logger.debug("Grasp at %s, success=%s", pose[:3], success)
 
         pb.changeDynamics(self.ee, self.ee_finger_pad_id, lateralFriction=0.9)
 
@@ -1719,17 +2129,17 @@ class Environment:
         success = self.move_joints(self.drop_joints0)
         success &= self.is_gripper_closed
         self.open_gripper(is_slow=True)
+        if self._oracle_grasp_constraint is not None:
+            self.release_oracle_grasp()
         self.go_home()
 
-        print(f"Move the object to the trash bin, success={success}")
+        logger.debug("Move the object to the trash bin, success=%s", success)
         pb.changeDynamics(self.ee, self.ee_finger_pad_id, lateralFriction=0.9)
         return success
 
     def place(self, pose, speed=0.005):
         """Execute placing primitive."""
-        pb.changeDynamics(
-            self.ee, self.ee_finger_pad_id, lateralFriction=0.9, spinningFriction=0.1
-        )
+        pb.changeDynamics(self.ee, self.ee_finger_pad_id, lateralFriction=0.9, spinningFriction=0.1)
 
         pose = np.array(pose, dtype=np.float32)
         rot = pose[-4:]
@@ -1738,12 +2148,9 @@ class Environment:
         transform[:3, :3] = R.from_quat(rot).as_matrix()
         transform[:3, 3] = pos
 
-        ee_tip_transform = np.array([
-            [0, 0, -1, 0],
-            [0, 1, 0, 0],
-            [1, 0, 0, -self.ee_tip_z_offset],
-            [0, 0, 0, 1]
-        ])
+        ee_tip_transform = np.array(
+            [[0, 0, -1, 0], [0, 1, 0, 0], [1, 0, 0, -self.ee_tip_z_offset], [0, 0, 0, 1]]
+        )
 
         ee_transform = transform @ ee_tip_transform
         pos = (ee_transform[:3, 3]).T
@@ -1755,11 +2162,16 @@ class Environment:
         success = self.move_ee_pose((over, rot))
 
         if success:
-            success = self.straight_move(over, pos, rot, speed/4, detect_force=True)
+            success = self.straight_move(over, pos, rot, speed / 4, detect_force=True)
             self.open_gripper(is_slow=True)
+            if self._oracle_grasp_constraint is not None:
+                self.release_oracle_grasp()
+            saved_recorder = self._frame_recorder
+            self._frame_recorder = None
             self.go_home()
+            self._frame_recorder = saved_recorder
 
-        print(f"Place at {pose[:3]}, success={success}")
+        logger.debug("Place at %s, success=%s", pose[:3], success)
 
         pb.changeDynamics(self.ee, self.ee_finger_pad_id, lateralFriction=0.9)
 
@@ -1813,27 +2225,24 @@ class Environment:
 
     @property
     def is_gripper_closed(self):
-        gripper_angle = pb.getJointState(
-            self.ee, self.gripper_main_joint, physicsClientId=self._client_id
-        )[0]
+        gripper_angle = pb.getJointState(self.ee, self.gripper_main_joint, physicsClientId=self._client_id)[0]
         return gripper_angle < self.gripper_angle_close_threshold
 
     def _move_gripper(self, target_angle, timeout=3, is_slow=False):
         """Move gripper to target angle."""
         # Longer timeout when recording (3x) and even longer with CPU rendering (10x)
-        cpu_render = os.environ.get('A2_DISABLE_EGL', '').lower() == 'true'
+        cpu_render = os.environ.get("A2_DISABLE_EGL", "").lower() == "true"
         if self._frame_recorder is not None:
             effective_timeout = timeout * 10 if cpu_render else timeout * 3
         else:
             effective_timeout = timeout * 3 if cpu_render else timeout
         t0 = time.time()
-        prev_angle = pb.getJointState(
-            self.ee, self.gripper_main_joint, physicsClientId=self._client_id
-        )[0]
+        prev_angle = pb.getJointState(self.ee, self.gripper_main_joint, physicsClientId=self._client_id)[0]
 
         if is_slow:
             pb.setJointMotorControl2(
-                self.ee, self.gripper_main_joint,
+                self.ee,
+                self.gripper_main_joint,
                 pb.VELOCITY_CONTROL,
                 targetVelocity=1 if target_angle > 0.5 else -1,
                 maxVelocity=1 if target_angle > 0.5 else -1,
@@ -1841,7 +2250,8 @@ class Environment:
                 physicsClientId=self._client_id,
             )
             pb.setJointMotorControl2(
-                self.ee, self.gripper_mimic_joints["right_outer_knuckle_joint"],
+                self.ee,
+                self.gripper_mimic_joints["right_outer_knuckle_joint"],
                 pb.VELOCITY_CONTROL,
                 targetVelocity=1 if target_angle > 0.5 else -1,
                 maxVelocity=1 if target_angle > 0.5 else -1,
@@ -1863,13 +2273,15 @@ class Environment:
                     self._maybe_record_frame()
 
         pb.setJointMotorControl2(
-            self.ee, self.gripper_main_joint,
+            self.ee,
+            self.gripper_main_joint,
             pb.POSITION_CONTROL,
             targetPosition=target_angle,
             force=3.1,
         )
         pb.setJointMotorControl2(
-            self.ee, self.gripper_mimic_joints["right_outer_knuckle_joint"],
+            self.ee,
+            self.gripper_mimic_joints["right_outer_knuckle_joint"],
             pb.POSITION_CONTROL,
             targetPosition=target_angle,
             force=3.1,

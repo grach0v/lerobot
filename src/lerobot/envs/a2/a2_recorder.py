@@ -8,7 +8,7 @@ robot state, and actions.
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import cv2
 import numpy as np
@@ -24,7 +24,7 @@ class VLARecorder:
     """
 
     # Available camera names
-    AVAILABLE_CAMERAS = ['front', 'left', 'right', 'top', 'side_left', 'side_right', 'overview', 'gripper']
+    AVAILABLE_CAMERAS = ["front", "left", "right", "top", "side_left", "side_right", "overview", "gripper"]
 
     def __init__(
         self,
@@ -34,6 +34,7 @@ class VLARecorder:
         image_size: tuple = (720, 1280),
         cameras: list = None,
         use_videos: bool = True,
+        vcodec: str = "h264",
     ):
         """Initialize VLA recorder.
 
@@ -44,17 +45,25 @@ class VLARecorder:
             image_size: Image size as (height, width).
             cameras: List of camera names to record ['front', 'left', 'right'].
             use_videos: Whether to encode frames as videos (True) or images (False).
+            vcodec: Video codec for encoding ('h264', 'hevc', 'libsvtav1').
+                h264 is fastest, libsvtav1 has best compression.
         """
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        import shutil
 
         self.fps = fps
         # Create unique dataset directory based on repo_id
         # LeRobotDataset.create expects this directory to not exist
-        self.output_dir = Path(output_dir) / repo_id.replace("/", "_")
+        base_dir = Path(output_dir) / repo_id.replace("/", "_")
+        self.output_dir = base_dir
         if self.output_dir.exists():
-            print(f"Warning: Removing existing dataset directory: {self.output_dir}")
-            shutil.rmtree(self.output_dir)
+            suffix = 1
+            while True:
+                candidate = Path(f"{base_dir}_{suffix}")
+                if not candidate.exists():
+                    self.output_dir = candidate
+                    print(f"Warning: Dataset directory exists, using {self.output_dir} instead")
+                    break
+                suffix += 1
         self.image_size = image_size
         self.cameras = cameras if cameras else self.AVAILABLE_CAMERAS
 
@@ -63,8 +72,8 @@ class VLARecorder:
             if cam not in self.AVAILABLE_CAMERAS:
                 raise ValueError(f"Unknown camera '{cam}'. Available: {self.AVAILABLE_CAMERAS}")
 
-        self.current_action: Optional[np.ndarray] = None
-        self.current_task: Optional[str] = None
+        self.current_action: np.ndarray | None = None
+        self.current_task: str | None = None
         self.current_attempt: int = 0
         self.current_reward: float = 0.0
         self.current_success: bool = False
@@ -79,37 +88,30 @@ class VLARecorder:
                 "dtype": "float32",
                 "shape": (14,),
                 "names": [
-                    "ee_x", "ee_y", "ee_z",
-                    "ee_qx", "ee_qy", "ee_qz", "ee_qw",
-                    "joint_0", "joint_1", "joint_2",
-                    "joint_3", "joint_4", "joint_5",
-                    "gripper"
-                ]
+                    "ee_x",
+                    "ee_y",
+                    "ee_z",
+                    "ee_qx",
+                    "ee_qy",
+                    "ee_qz",
+                    "ee_qw",
+                    "joint_0",
+                    "joint_1",
+                    "joint_2",
+                    "joint_3",
+                    "joint_4",
+                    "joint_5",
+                    "gripper",
+                ],
             },
             # Action: 7D grasp/place pose (position + quaternion)
-            "action": {
-                "dtype": "float32",
-                "shape": (7,),
-                "names": ["x", "y", "z", "qx", "qy", "qz", "qw"]
-            },
+            "action": {"dtype": "float32", "shape": (7,), "names": ["x", "y", "z", "qx", "qy", "qz", "qw"]},
             # Attempt index within episode (0-indexed)
-            "attempt_idx": {
-                "dtype": "int32",
-                "shape": (1,),
-                "names": ["attempt"]
-            },
+            "attempt_idx": {"dtype": "int32", "shape": (1,), "names": ["attempt"]},
             # Step reward for current action
-            "step_reward": {
-                "dtype": "float32",
-                "shape": (1,),
-                "names": ["reward"]
-            },
+            "step_reward": {"dtype": "float32", "shape": (1,), "names": ["reward"]},
             # Whether this step was successful
-            "step_success": {
-                "dtype": "bool",
-                "shape": (1,),
-                "names": ["success"]
-            },
+            "step_success": {"dtype": "bool", "shape": (1,), "names": ["success"]},
         }
 
         # Add only selected cameras
@@ -117,7 +119,7 @@ class VLARecorder:
             features[f"observation.images.{cam_name}"] = {
                 "dtype": "video" if use_videos else "image",
                 "shape": (3, image_size[0], image_size[1]),
-                "names": ["channels", "height", "width"]
+                "names": ["channels", "height", "width"],
             }
 
         self.dataset = LeRobotDataset.create(
@@ -127,8 +129,9 @@ class VLARecorder:
             root=str(self.output_dir),
             robot_type="ur5e_robotiq",
             use_videos=use_videos,
+            vcodec=vcodec,
             image_writer_processes=0,  # Use threads only (more reliable than subprocesses)
-            image_writer_threads=8,    # 8 threads for async image writing
+            image_writer_threads=8,  # 8 threads for async image writing
         )
 
         print(f"VLARecorder initialized: {repo_id} at {output_dir}")
@@ -198,20 +201,22 @@ class VLARecorder:
             return
 
         # Build state vector: [ee_pos(3), ee_quat(4), joints(6), gripper(1)] = 14D
-        state = np.concatenate([
-            robot_state['ee_pos'],
-            robot_state['ee_quat'],
-            robot_state['joints'],
-            np.array([robot_state['gripper_angle']])
-        ]).astype(np.float32)
+        state = np.concatenate(
+            [
+                robot_state["ee_pos"],
+                robot_state["ee_quat"],
+                robot_state["joints"],
+                np.array([robot_state["gripper_angle"]]),
+            ]
+        ).astype(np.float32)
 
         # Build frame with state, action, and metadata
         frame = {
             "observation.state": state,
             "action": self.current_action,
-            "attempt_idx": np.array([self.current_attempt], dtype=np.int32),
-            "step_reward": np.array([self.current_reward], dtype=np.float32),
-            "step_success": np.array([self.current_success], dtype=bool),
+            "attempt_idx": np.array(self.current_attempt, dtype=np.int32),
+            "step_reward": np.array(self.current_reward, dtype=np.float32),
+            "step_success": np.array(self.current_success, dtype=bool),
             "task": self.current_task,
         }
 
@@ -226,7 +231,9 @@ class VLARecorder:
 
         # Print progress every 10 frames
         if self._frame_count % 10 == 0:
-            print(f"    [VLA] Recorded {self._frame_count} frames (attempt {self.current_attempt})...", end='\r')
+            print(
+                f"    [VLA] Recorded {self._frame_count} frames (attempt {self.current_attempt})...", end="\r"
+            )
             sys.stdout.flush()
 
     def end_episode(self, success: bool = True, total_reward: float = 0.0, num_attempts: int = 0):
@@ -243,8 +250,10 @@ class VLARecorder:
         if self._frame_count > 0:
             elapsed = time.time() - self._episode_start_time
             self.dataset.save_episode()
-            print(f"  [VLA] Saved episode {self._episode_count}: {self._frame_count} frames, "
-                  f"{num_attempts} attempts, reward={total_reward:.2f}, success={success} ({elapsed:.1f}s)")
+            print(
+                f"  [VLA] Saved episode {self._episode_count}: {self._frame_count} frames, "
+                f"{num_attempts} attempts, reward={total_reward:.2f}, success={success} ({elapsed:.1f}s)"
+            )
             self._episode_count += 1
         else:
             print(f"  [VLA] Discarded empty episode {self._episode_count}")
