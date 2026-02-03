@@ -326,74 +326,112 @@ def _run_pickplace_episode(
     """Run a pick-and-place episode with separate grasp and place phases (A2_new style).
 
     Phase 1: Retry grasp until we successfully grasp a target object
-    Phase 2: Retry place until we successfully place the object
+    Phase 2: Retry place until we successfully select a valid place pose
 
     Returns:
         (success, total_reward, attempt_count)
     """
-    grasp_lang_goal = getattr(env._env, "grasp_lang_goal", None) or getattr(env._env, "lang_goal", "grasp an object")
+    # Workspace limits matching original A2 benchmark
+    GRASP_WORKSPACE_Y = (-0.336, 0.000)
+    PLACE_WORKSPACE_Y = (0.000, 0.336)
+
+    grasp_lang_goal = getattr(env._env, "grasp_lang_goal", None) or getattr(
+        env._env, "lang_goal", "grasp an object"
+    )
     place_lang_goal = getattr(env._env, "place_lang_goal", None) or "place it somewhere"
 
     grasp_done = False
     place_done = False
     total_reward = 0.0
     attempt_count = 0
-    grasped_obj_id = None
+
+    recorders = [rec for rec in (recorder, success_recorder) if rec is not None]
+
+    def _set_attempt_idx(idx: int):
+        for rec in recorders:
+            if rec.is_recording:
+                rec._current_attempt = idx
+
+    def _update_step_result(reward: float, success: bool):
+        for rec in recorders:
+            if rec.is_recording:
+                rec.update_step_result(reward=reward, success=success)
 
     # Phase 1: Grasp attempts
     print(f"  [Grasp phase] Goal: {grasp_lang_goal}")
     for grasp_attempt in range(max_attempts):
-        # Check if target objects still in workspace
+        # Check if target objects are in grasp workspace (y < 0)
         if env._env.target_obj_ids:
             valid_targets = []
             for obj_id in env._env.target_obj_ids:
                 pos, _, _ = env._env.obj_info(obj_id)
-                bounds = env._env.bounds
-                if bounds[0][0] <= pos[0] <= bounds[0][1] and bounds[1][0] <= pos[1] <= bounds[1][1]:
+                if GRASP_WORKSPACE_Y[0] <= pos[1] <= GRASP_WORKSPACE_Y[1]:
                     valid_targets.append(obj_id)
             if not valid_targets:
-                print("    Target objects not in workspace!")
+                print("    No targets in grasp workspace")
                 break
 
-        # Get observation and predict grasp
         color_images, depth_images, pcd = _get_observation_data(env)
 
+        # Filter point cloud to grasp workspace (y < 0)
+        if pcd is not None and len(pcd) > 0:
+            grasp_mask = (pcd[:, 1] >= GRASP_WORKSPACE_Y[0]) & (pcd[:, 1] <= GRASP_WORKSPACE_Y[1])
+            pcd_grasp = pcd[grasp_mask]
+            if len(pcd_grasp) < 100:
+                pcd_grasp = pcd
+        else:
+            pcd_grasp = pcd
+
+        # Target object poses limited to grasp workspace
         object_poses = env._env.get_true_object_poses()
-        reference_ids = getattr(env._env, "reference_obj_ids", None) or []
-        graspable_ids = [oid for oid in env._env.obj_ids["rigid"] if oid not in reference_ids]
-        target_object_poses = {oid: pose for oid, pose in object_poses.items() if oid in graspable_ids}
+        target_object_poses = {}
+        for oid, pose in object_poses.items():
+            if oid in env._env.target_obj_ids:
+                pos = pose[:3, 3] if isinstance(pose, np.ndarray) and pose.shape == (4, 4) else pose[:3]
+                if GRASP_WORKSPACE_Y[0] <= pos[1] <= GRASP_WORKSPACE_Y[1]:
+                    target_object_poses[oid] = pose
 
         grasp_action, _ = _predict_grasp_pose(
-            policy, color_images, depth_images, pcd, grasp_lang_goal, device,
-            object_poses=target_object_poses, env=env
+            policy,
+            color_images,
+            depth_images,
+            pcd_grasp,
+            grasp_lang_goal,
+            device,
+            object_poses=target_object_poses,
+            env=env,
+            is_pickplace=True,
         )
 
         if grasp_action is None:
             print(f"    Grasp attempt {grasp_attempt + 1}: No valid grasp")
             continue
 
-        print(f"    Grasp attempt {grasp_attempt + 1}: pos=({grasp_action[0]:.3f}, {grasp_action[1]:.3f}, {grasp_action[2]:.3f})")
+        print(
+            f"    Grasp attempt {grasp_attempt + 1}: pos=({grasp_action[0]:.3f}, {grasp_action[1]:.3f}, {grasp_action[2]:.3f})"
+        )
 
-        # Execute grasp (keep holding for place)
+        _set_attempt_idx(attempt_count)
         env._env.set_current_action(grasp_action)
         grasp_success, grasped_obj_id, _ = env._env.grasp(grasp_action, follow_place=True)
         attempt_count += 1
 
         if not grasp_success:
-            print(f"      Grasp failed")
+            print("      Grasp failed")
             total_reward -= 1
+            _update_step_result(reward=-1.0, success=False)
             continue
 
-        # Check if we grasped a target object
         if grasped_obj_id in env._env.target_obj_ids:
-            print(f"      Grasped target object!")
+            print("      Grasped target!")
             total_reward += 2
             grasp_done = True
+            _update_step_result(reward=2.0, success=True)
             break
-        else:
-            print(f"      Grasped wrong object, dropping...")
-            total_reward += 0
-            env._env.place_out_of_workspace()
+
+        print("      Wrong object, dropping")
+        env._env.place_out_of_workspace()
+        _update_step_result(reward=0.0, success=False)
 
     if not grasp_done:
         print("  [Grasp phase] Failed to grasp target")
@@ -401,36 +439,54 @@ def _run_pickplace_episode(
 
     # Phase 2: Place attempts
     print(f"  [Place phase] Goal: {place_lang_goal}")
-    remaining_attempts = max_attempts - attempt_count
-    for place_attempt in range(max(1, remaining_attempts)):
-        # Get fresh observation for place
+    remaining_attempts = max(1, max_attempts - attempt_count)
+    for place_attempt in range(remaining_attempts):
         color_images, depth_images, pcd = _get_observation_data(env)
 
-        place_action, _ = _predict_place_pose(
-            policy, color_images, depth_images, pcd, place_lang_goal, device
+        # Filter point cloud to place workspace (y > 0)
+        if pcd is not None and len(pcd) > 0:
+            place_mask = (pcd[:, 1] >= PLACE_WORKSPACE_Y[0]) & (pcd[:, 1] <= PLACE_WORKSPACE_Y[1])
+            pcd_place = pcd[place_mask]
+            if len(pcd_place) < 100:
+                pcd_place = pcd
+        else:
+            pcd_place = pcd
+
+        place_action, info = _predict_place_pose(
+            policy,
+            color_images,
+            depth_images,
+            pcd_place,
+            place_lang_goal,
+            device,
+            env=env,
+            is_pickplace=True,
         )
 
         if place_action is None:
             print(f"    Place attempt {place_attempt + 1}: No valid place pose")
             continue
 
-        print(f"    Place attempt {place_attempt + 1}: pos=({place_action[0]:.3f}, {place_action[1]:.3f}, {place_action[2]:.3f})")
+        place_valid = bool(info.get("place_valid", False)) if info else False
+        print(
+            f"    Place attempt {place_attempt + 1}: pos=({place_action[0]:.3f}, {place_action[1]:.3f}, {place_action[2]:.3f})"
+        )
 
-        # Execute place
+        _set_attempt_idx(attempt_count)
         env._env.set_current_action(place_action)
-        place_success = env._env.place(place_action)
+        env._env.place(place_action)
         attempt_count += 1
 
-        if place_success:
-            # Check if placement is correct (near reference object in correct direction)
-            # For now, trust the environment's success signal
-            print(f"      Place succeeded!")
+        if place_valid:
+            print("      SUCCESS! (selected from valid candidates)")
             total_reward += 2
             place_done = True
+            _update_step_result(reward=2.0, success=True)
             break
-        else:
-            print(f"      Place failed")
-            total_reward -= 1
+
+        print("      FAIL (selected from invalid candidates)")
+        total_reward -= 0.5
+        _update_step_result(reward=-0.5, success=False)
 
     env._env.go_home()
 
@@ -556,8 +612,16 @@ def _collect_pose_mode(
         episode_success = False
         attempt_count = 0
 
+        max_attempts_task = 1 if task == "place" else max_attempts
+
         # Special handling for pick_and_place: two-phase execution (A2_new style)
         if task == "pick_and_place":
+            if recorder is not None and not recorder_started:
+                recorder.start_episode(task=lang_goal)
+                recorder_started = True
+            if success_recorder is not None and record_success_only_success and not success_recorder_started:
+                success_recorder.start_episode(task=lang_goal)
+                success_recorder_started = True
             episode_success, episode_reward, attempt_count = _run_pickplace_episode(
                 env, policy, max_attempts, device, recorder, success_recorder
             )
@@ -567,23 +631,36 @@ def _collect_pose_mode(
 
             # Handle recording
             if recorder is not None:
-                if not record_success_only_main:
-                    recorder.end_episode(success=episode_success, total_reward=episode_reward, num_attempts=attempt_count)
-                elif episode_success:
-                    recorder.start_episode(task=lang_goal)
-                    recorder.end_episode(success=True, total_reward=episode_reward, num_attempts=attempt_count)
+                if record_success_only_main and recorder_started and not episode_success:
+                    recorder.cancel_episode()
+                    recorder_started = False
+                if not record_success_only_main or recorder_started:
+                    recorder.end_episode(
+                        success=episode_success, total_reward=episode_reward, num_attempts=attempt_count
+                    )
+
+            if success_recorder is not None and success_recorder_started:
+                if episode_success:
+                    success_recorder.end_episode(
+                        success=True, total_reward=episode_reward, num_attempts=attempt_count
+                    )
+                else:
+                    success_recorder.cancel_episode()
+                success_recorder_started = False
 
             # Save progress
             save_progress(output_dir, repo_id, episode + 1, success_count, total_attempts)
 
             # Summary
-            print(f"Episode {episode + 1}: {'SUCCESS' if episode_success else 'FAIL'} | "
-                  f"Running: {success_count}/{episode + 1 - start_episode} "
-                  f"({100 * success_count / (episode + 1 - start_episode):.1f}%)")
+            print(
+                f"Episode {episode + 1}: {'SUCCESS' if episode_success else 'FAIL'} | "
+                f"Running: {success_count}/{episode + 1 - start_episode} "
+                f"({100 * success_count / (episode + 1 - start_episode):.1f}%)"
+            )
             cleanup_gpu_memory()
             continue  # Skip the regular attempt loop
 
-        for attempt in range(max_attempts):
+        for attempt in range(max_attempts_task):
             # Check if target objects still in workspace (grasp tasks only)
             if env._env.target_obj_ids:
                 out_of_workspace = []
@@ -695,7 +772,14 @@ def _collect_pose_mode(
             env._env.set_current_action(action)
 
             # Execute action (this triggers internal frame recording)
-            if task == "pick_and_place":
+            if task == "place":
+                place_valid = bool(info_dict.get("place_valid", False)) if info_dict else False
+                reward = 2.0 if place_valid else 0.0
+                info = {"is_success": place_valid}
+                terminated = place_valid
+                truncated = False
+                obs = env._get_observation()
+            elif task == "pick_and_place":
                 if oracle_grasp:
                     print("  Note: oracle_grasp ignored for pick_and_place")
                 reward, success = env._env.step_place(
@@ -735,6 +819,18 @@ def _collect_pose_mode(
                 recorder.update_step_result(reward=reward, success=info.get("is_success", False))
             if success_recorder is not None and success_recorder_started:
                 success_recorder.update_step_result(reward=reward, success=info.get("is_success", False))
+
+            if task == "place":
+                if recorder is not None and recorder_started:
+                    _record_frame(recorder, obs, np.asarray(action), attempt_idx=attempt)
+                if success_recorder is not None and success_recorder_started:
+                    _record_frame(success_recorder, obs, np.asarray(action), attempt_idx=attempt)
+            # Record a terminal frame on success so step_success is persisted
+            if task != "place" and info.get("is_success", False):
+                if recorder is not None and recorder_started:
+                    _record_frame(recorder, obs, np.asarray(action), attempt_idx=attempt)
+                if success_recorder is not None and success_recorder_started:
+                    _record_frame(success_recorder, obs, np.asarray(action), attempt_idx=attempt)
 
             episode_reward += reward
             attempt_count += 1
@@ -945,7 +1041,15 @@ def _get_observation_data(env):
 
 
 def _predict_grasp_pose(
-    policy, color_images, depth_images, pcd, lang_goal, device, object_poses=None, env=None, is_pickplace=False
+    policy,
+    color_images,
+    depth_images,
+    pcd,
+    lang_goal,
+    device,
+    object_poses=None,
+    env=None,
+    is_pickplace=False,
 ):
     """Use policy to predict a grasp pose.
 
@@ -1006,6 +1110,7 @@ def _predict_grasp_pose(
         except Exception as e:
             print(f"Warning: learned networks grasp failed: {e}")
             import traceback
+
             traceback.print_exc()
         finally:
             # Cleanup batch tensors to prevent GPU memory leaks
@@ -1121,7 +1226,9 @@ def _topdown_place_quat() -> np.ndarray:
     return np.array([0.17277328, 0.98479404, 0.01092275, -0.01451854], dtype=np.float32)
 
 
-def _predict_place_pose(policy, color_images, depth_images, pcd, lang_goal, device, env=None, is_pickplace=False):
+def _predict_place_pose(
+    policy, color_images, depth_images, pcd, lang_goal, device, env=None, is_pickplace=False
+):
     """Use policy to predict a place pose.
 
     Args:
@@ -1205,6 +1312,7 @@ def _predict_place_pose(policy, color_images, depth_images, pcd, lang_goal, devi
         except Exception as e:
             print(f"Warning: _generate_place_target failed: {e}")
             import traceback
+
             traceback.print_exc()
         finally:
             if batch is not None:
@@ -1214,9 +1322,7 @@ def _predict_place_pose(policy, color_images, depth_images, pcd, lang_goal, devi
     if hasattr(policy, "predict_place"):
         try:
             # Pass env for reference object info
-            action, info = policy.predict_place(
-                color_images, depth_images, pcd, lang_goal, env=env
-            )
+            action, info = policy.predict_place(color_images, depth_images, pcd, lang_goal, env=env)
             if action is not None and len(action) >= 7:
                 action = np.array(action, dtype=np.float32)
                 action[3:7] = _topdown_place_quat()

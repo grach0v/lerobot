@@ -182,7 +182,7 @@ outputs/
 tmp*
 dataset_a2*
 asset_renders
-benchmark_results*
+benchmark_*
 AGENTS.md
 CLAUDE.md
 cases

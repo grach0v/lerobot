@@ -42,6 +42,8 @@ from .a2_constants import (
     LABEL_DIR_MAP,
     LANG_TEMPLATES,
     PIXEL_SIZE,
+    PP_PIXEL_SIZE,
+    PP_WORKSPACE_LIMITS,
     # Test object constants
     UNSEEN_COLOR_SHAPE,
     UNSEEN_FUNCTION,
@@ -71,19 +73,20 @@ class Environment:
         "gripper": -1,  # special: dynamic camera attached to gripper
     }
 
-    def __init__(self, gui=True, time_step=1 / 240, object_set="train"):
+    def __init__(self, gui=True, time_step=1 / 240, object_set="train", task="grasp"):
         """Creates environment with PyBullet.
 
         Args:
             gui: Show environment with PyBullet's built-in display viewer.
             time_step: PyBullet physics simulation step speed. Default is 1/240.
             object_set: "train" for simplified_objects, "test" for unseen_objects.
+            task: "grasp", "place", or "pickplace"/"pick_and_place" - affects workspace bounds.
         """
         self.time_step = time_step
         self.gui = gui
         self.object_set = object_set
+        self.task = task
         self._allow_untextured = os.environ.get("A2_ALLOW_UNTEXTURED", "true").lower() == "true"
-        self.pixel_size = PIXEL_SIZE
         self.case_dir = "cases/"
         os.makedirs(self.case_dir, exist_ok=True)  # Ensure case directory exists
         self.obj_ids = {"fixed": [], "rigid": []}
@@ -95,7 +98,13 @@ class Environment:
         self.test_file_name = None
         self.agent_cams = cameras.RealSenseL515.CONFIG
         self.oracle_cams = cameras.Oracle.CONFIG
-        self.bounds = WORKSPACE_LIMITS
+        # Use extended bounds and different pixel size for pickplace tasks
+        if task in ("pickplace", "pick_and_place"):
+            self.bounds = PP_WORKSPACE_LIMITS
+            self.pixel_size = PP_PIXEL_SIZE
+        else:
+            self.bounds = WORKSPACE_LIMITS
+            self.pixel_size = PIXEL_SIZE
         self.home_joints = np.array([0, -0.8, 0.5, -0.2, -0.5, 0]) * np.pi
         self.ik_rest_joints = np.array([0, -0.5, 0.5, -0.5, -0.5, 0]) * np.pi
         self.drop_joints0 = np.array([-0.5, -0.5, 0.5, -0.5, -0.5, 0]) * np.pi

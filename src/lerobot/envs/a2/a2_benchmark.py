@@ -157,6 +157,7 @@ class A2Benchmark:
             - depth_images: Dict[camera_name, np.ndarray (H, W)]
             - point_cloud: np.ndarray (N, 6) with xyz + rgb
             - robot_state: Dict with ee_pos, ee_quat, joints, gripper
+            - camera_configs: List of camera configurations for per-point CLIP features
         """
         cameras = cameras or ["front", "left", "right"]
 
@@ -177,11 +178,18 @@ class A2Benchmark:
         # Get robot state
         robot_state = self.env.get_robot_state()
 
+        # Get camera configs for per-point CLIP feature extraction
+        camera_configs = []
+        if hasattr(self.env, "agent_cams"):
+            for i in range(min(3, len(self.env.agent_cams))):
+                camera_configs.append(self.env.agent_cams[i])
+
         return {
             "color_images": color_images,
             "depth_images": depth_images,
             "point_cloud": point_cloud,
             "robot_state": robot_state,
+            "camera_configs": camera_configs,
         }
 
     def evaluate_grasp(self, test_case_path: str) -> BenchmarkResult:
@@ -305,6 +313,22 @@ class A2Benchmark:
                 if self.action_generator:
                     candidate_poses = self.action_generator(self.env, "place")
 
+                # Get reference object information from environment
+                reference_obj_ids = getattr(self.env, "reference_obj_ids", [])
+                reference_obj_dirs = getattr(self.env, "reference_obj_dirs", [])
+                reference_positions = []
+                reference_sizes = []
+                for ref_id in reference_obj_ids:
+                    pos, quat, size = self.env.obj_info(ref_id)
+                    reference_positions.append(pos)
+                    reference_sizes.append(size if size is not None else [0.05, 0.05, 0.05])
+
+                # Get direction from environment
+                direction = reference_obj_dirs[0] if reference_obj_dirs else None
+
+                # Get all object poses
+                object_poses = self.env.get_true_object_poses()
+
                 # Get action from policy
                 action, info = self.policy.select_place_action(
                     color_images=obs["color_images"],
@@ -312,6 +336,11 @@ class A2Benchmark:
                     point_cloud=obs["point_cloud"],
                     lang_goal=lang_goal,
                     candidate_poses=candidate_poses,
+                    reference_positions=reference_positions,
+                    reference_sizes=reference_sizes,
+                    direction=direction,
+                    object_poses=object_poses,
+                    camera_configs=obs.get("camera_configs"),
                 )
 
                 # For place evaluation, we check if the selected pose is valid
@@ -389,21 +418,34 @@ class A2Benchmark:
             steps = 0
 
             # Grasp phase
+            # Import constants for grasp workspace
+            from .a2_constants import GRASP_WORKSPACE_LIMITS
+
             for _step in range(self.config.max_steps):
-                if not self._check_targets_in_workspace():
+                # Check if target objects are in grasp workspace (not just general workspace)
+                target_in_grasp_ws = self._check_targets_in_workspace_limits(GRASP_WORKSPACE_LIMITS)
+                if not target_in_grasp_ws:
+                    print("    Target objects out of grasp workspace")
                     break
 
                 obs = self.get_observations()
+
+                # Filter point cloud to grasp workspace limits for grasp phase
+                # This matches original A2 behavior
+                grasp_pcd = self._filter_pointcloud_to_workspace(obs["point_cloud"], GRASP_WORKSPACE_LIMITS)
+
                 candidate_poses = None
                 if self.action_generator:
                     candidate_poses = self.action_generator(self.env, "grasp")
 
+                # Pass is_pickplace=True for workspace shift (original A2 uses --workspace_shift only for pickplace)
                 action, info = self.policy.select_grasp_action(
                     color_images=obs["color_images"],
                     depth_images=obs["depth_images"],
-                    point_cloud=obs["point_cloud"],
+                    point_cloud=grasp_pcd,
                     lang_goal=grasp_lang,
                     candidate_poses=candidate_poses,
+                    is_pickplace=True,
                 )
 
                 # Execute grasp - pass 7D array directly
@@ -550,6 +592,55 @@ class A2Benchmark:
                 return False
         return True
 
+    def _check_targets_in_workspace_limits(self, workspace_limits: np.ndarray) -> bool:
+        """Check if target objects are within specific workspace limits.
+
+        Args:
+            workspace_limits: Workspace limits array of shape (3, 2) for x, y, z bounds
+
+        Returns:
+            True if all target objects are in the specified workspace, False otherwise
+        """
+        for obj_id in self.env.target_obj_ids:
+            pos, _, _ = self.env.obj_info(obj_id)
+            if not (
+                workspace_limits[0, 0] <= pos[0] <= workspace_limits[0, 1]
+                and workspace_limits[1, 0] <= pos[1] <= workspace_limits[1, 1]
+            ):
+                return False
+        return True
+
+    def _filter_pointcloud_to_workspace(
+        self, point_cloud: np.ndarray, workspace_limits: np.ndarray
+    ) -> np.ndarray:
+        """Filter point cloud to only include points within workspace limits.
+
+        Args:
+            point_cloud: Point cloud array of shape (N, 6) with xyz + rgb
+            workspace_limits: Workspace limits array of shape (3, 2) for x, y, z bounds
+
+        Returns:
+            Filtered point cloud array
+        """
+        points = point_cloud[:, :3]
+        colors = point_cloud[:, 3:]
+
+        # Filter points within workspace bounds
+        ix = (points[:, 0] >= workspace_limits[0, 0]) & (points[:, 0] < workspace_limits[0, 1])
+        iy = (points[:, 1] >= workspace_limits[1, 0]) & (points[:, 1] < workspace_limits[1, 1])
+        iz = (points[:, 2] >= workspace_limits[2, 0]) & (points[:, 2] < workspace_limits[2, 1])
+
+        valid = ix & iy & iz
+        filtered_points = points[valid]
+        filtered_colors = colors[valid]
+
+        # Sort by z-value (height) to simulate z-buffering
+        iz_sort = np.argsort(filtered_points[:, 2])
+        filtered_points = filtered_points[iz_sort]
+        filtered_colors = filtered_colors[iz_sort]
+
+        return np.concatenate([filtered_points, filtered_colors], axis=1).astype(np.float32)
+
     def _check_targets_in_workspace(self) -> bool:
         """Check if target objects are still in workspace."""
         return self._check_objects_in_workspace(self.env.target_obj_ids)
@@ -653,7 +744,9 @@ def main():
     elif args.policy == "a2":
         from .a2_collect import create_a2_policy
 
-        policy = create_a2_policy(model_path=args.model_path, hf_repo=args.hf_repo, device=args.device)
+        # Use default hf_repo if not provided (empty string overrides default)
+        hf_repo = args.hf_repo if args.hf_repo else "dgrachev/a2_pretrained"
+        policy = create_a2_policy(model_path=args.model_path, hf_repo=hf_repo, device=args.device)
     else:
         raise ValueError(f"Unknown policy: {args.policy}")
 

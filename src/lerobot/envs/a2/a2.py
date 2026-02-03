@@ -184,7 +184,7 @@ class A2Env(gym.Env):
         # Import and create environment from local module
         from .a2_sim import Environment
 
-        self._env = Environment(gui=self.gui, object_set=self.object_set)
+        self._env = Environment(gui=self.gui, object_set=self.object_set, task=self.task)
 
         # Setup workspace based on task
         workspace = "extend" if self.task == "pick_and_place" else "raw"

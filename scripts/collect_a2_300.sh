@@ -1,12 +1,12 @@
 #!/bin/bash
-# Collect 300 episodes of each A2 task (grasp, place, pick_and_place)
+# Collect 1000 episodes of each A2 task (grasp, place, pick_and_place)
 #
 # Usage:
 #   ./scripts/collect_a2_300.sh                    # Run all tasks sequentially
 #   ./scripts/collect_a2_300.sh --parallel         # Run all tasks in parallel
 #   ./scripts/collect_a2_300.sh --task grasp       # Run single task
 #
-# Output: dataset_a2_300/{grasp,place,pick_and_place}_300/
+# Output: dataset_a2_1000/{grasp,place,pick_and_place}_1000/
 
 set -e
 
@@ -18,7 +18,7 @@ FPS=30
 IMAGE_HEIGHT=480
 IMAGE_WIDTH=640
 DEVICE="cuda"
-OUTPUT_BASE="dataset_a2_1000_2"
+OUTPUT_BASE="dataset_a2_1000"
 OBJECT_SET="train"  # "train" = seen objects, "test" = unseen objects
 # Environment reset interval to prevent GPU memory leak (PyBullet EGL leak)
 # Memory grows ~300-500MB per episode per process
@@ -66,8 +66,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --parallel              Run tasks in parallel"
             echo "  --task TASK             Single task: grasp, place, or pick_and_place"
-            echo "  --episodes N            Number of episodes per task (default: 1000)"
-            echo "  --output DIR            Output directory (default: dataset_a2_1000_2)"
+    echo "  --episodes N            Number of episodes per task (default: 1000)"
+    echo "  --output DIR            Output directory (default: dataset_a2_1000)"
             echo "  --object_set SET        Object set: 'train' (seen) or 'test' (unseen)"
             echo "  --seen                  Use seen objects (alias for --object_set train)"
             echo "  --unseen                Use unseen objects (alias for --object_set test)"
@@ -112,6 +112,7 @@ collect_task() {
         --output_dir "$output_dir" \
         --repo_id "$repo_id" \
         --env_reset_interval "$ENV_RESET_INTERVAL" \
+        --distinguish_failed_attempts \
         $extra_args \
         2>&1 | tee "$log_file"
 
@@ -120,7 +121,7 @@ collect_task() {
 
 # Task-specific arguments
 GRASP_ARGS=""
-PLACE_ARGS="--oracle_grasp"
+PLACE_ARGS=""
 PP_ARGS=""
 
 # Determine which tasks to run

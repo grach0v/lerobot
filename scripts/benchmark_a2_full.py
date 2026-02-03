@@ -693,11 +693,13 @@ def run_pickplace_episode(
 
         color_images, depth_images, pcd = _get_observation_data(env)
 
-        # Filter point cloud to grasp workspace (y < 0)
+        # Filter point cloud to grasp workspace (y < 0) - matching original A2 evaluator
+        # This is critical: original A2 filters PCD to workspace BEFORE CLIP feature extraction
         if pcd is not None and len(pcd) > 0:
             grasp_mask = (pcd[:, 1] >= GRASP_WORKSPACE_Y[0]) & (pcd[:, 1] <= GRASP_WORKSPACE_Y[1])
             pcd_grasp = pcd[grasp_mask]
             if len(pcd_grasp) < 100:
+                print(f"    [DEBUG] Too few points in grasp workspace ({len(pcd_grasp)}), using full PCD")
                 pcd_grasp = pcd  # Fallback if too few points
         else:
             pcd_grasp = pcd
