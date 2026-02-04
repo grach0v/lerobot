@@ -436,12 +436,13 @@ def collect_data(
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Create recorder for successful episodes
+    # Cameras: front, left, right for policy + gripper for VLA training
     recorder = VLARecorder(
         output_dir=str(output_path),
         repo_id=f"local/{task}_{object_set}",
         fps=fps,
         image_size=(image_height, image_width),
-        cameras=["front", "left", "right"],
+        cameras=["front", "left", "right", "gripper"],
     )
 
     # Stats
@@ -459,7 +460,7 @@ def collect_data(
     test_case_idx = 0
     episode = 0
     env = None
-    cameras = ["front", "left", "right"]
+    cameras = ["front", "left", "right", "gripper"]
     render_size = (image_width, image_height)
 
     def setup_frame_recorder(environment, rec):

@@ -1010,13 +1010,21 @@ def _collect_delta_mode(
     print(f"  Total steps: {total_steps}")
 
 
-def _get_observation_data(env):
+def _get_observation_data(env, return_separate_pcds=True):
     """Get color images, depth images, and point cloud from environment.
+
+    Args:
+        env: A2 environment
+        return_separate_pcds: If True, return separate point clouds for GraspNet and CLIP
 
     Returns:
         color_images: Dict mapping camera name to RGB image (H, W, 3)
         depth_images: Dict mapping camera name to depth image (H, W)
         point_cloud: Point cloud array (N, 6) with XYZ + RGB
+            - If return_separate_pcds=True, returns (pcd_graspnet, pcd_clip)
+              - pcd_graspnet: Dense cloud (voxel_size=0.0015) for grasp candidate generation
+              - pcd_clip: Sparser cloud (voxel_size=0.01) with table filtered for CLIP features
+            - If return_separate_pcds=False, returns single pcd (backward compat)
     """
     # Get images from cameras
     color_images = {}
@@ -1034,14 +1042,57 @@ def _get_observation_data(env):
             color = env._env.render_camera_fast(config, (480, 640))
         color_images[cam_name] = color
 
-    # Get point cloud
+    # Get point clouds with different voxel sizes
+    # CRITICAL: Original A2 uses 0.0015 for GraspNet, 0.01 for CLIP features
     try:
-        pcd = env._env.get_pointcloud_array(cameras=[0, 1, 2], max_points=20000)
+        if return_separate_pcds:
+            # Dense cloud for GraspNet (matches A2_new voxel_size=0.0015)
+            pcd_graspnet, _, _ = env._env.get_multi_view_pointcloud(
+                cameras=[0, 1, 2], downsample=True, voxel_size=0.0015
+            )
+            pcd_graspnet_arr = _pcd_to_array(pcd_graspnet, max_points=50000)
+
+            # Sparser cloud for CLIP features (matches A2_new generate_points_for_feature_extraction)
+            pcd_clip, _, _ = env._env.get_multi_view_pointcloud(
+                cameras=[0, 1, 2], downsample=True, voxel_size=0.01
+            )
+            # Filter table points (z > 0.001) as in original A2
+            pcd_clip_arr = _pcd_to_array(pcd_clip, max_points=20000)
+            if len(pcd_clip_arr) > 0:
+                table_mask = pcd_clip_arr[:, 2] > 0.001  # Filter points above table
+                pcd_clip_arr = pcd_clip_arr[table_mask]
+
+            return color_images, depth_images, (pcd_graspnet_arr, pcd_clip_arr)
+        else:
+            # Backward compatibility: single cloud
+            pcd = env._env.get_pointcloud_array(cameras=[0, 1, 2], max_points=20000)
+            return color_images, depth_images, pcd
     except Exception as e:
         print(f"Warning: Could not get point cloud: {e}")
-        pcd = np.zeros((100, 6), dtype=np.float32)
+        if return_separate_pcds:
+            empty = np.zeros((100, 6), dtype=np.float32)
+            return color_images, depth_images, (empty, empty)
+        else:
+            return color_images, depth_images, np.zeros((100, 6), dtype=np.float32)
 
-    return color_images, depth_images, pcd
+
+def _pcd_to_array(pcd, max_points=20000):
+    """Convert Open3D point cloud to numpy array."""
+    if len(pcd.points) == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors) * 255.0  # Convert to 0-255 range
+
+    # Combine points and colors
+    point_cloud = np.concatenate([points, colors], axis=1)
+
+    # Subsample if needed
+    if len(point_cloud) > max_points:
+        indices = np.random.choice(len(point_cloud), max_points, replace=False)
+        point_cloud = point_cloud[indices]
+
+    return point_cloud.astype(np.float32)
 
 
 def _predict_grasp_pose(
@@ -1058,6 +1109,11 @@ def _predict_grasp_pose(
     """Use policy to predict a grasp pose.
 
     Args:
+        pcd: Point cloud - either:
+            - Single array (N, 6) for backward compatibility
+            - Tuple (pcd_graspnet, pcd_clip) for separate GraspNet/CLIP point clouds
+              - pcd_graspnet: Dense cloud (voxel_size=0.0015) for GraspNet
+              - pcd_clip: Sparser cloud (voxel_size=0.01) with table filtered for CLIP
         is_pickplace: If True, apply workspace shift for pickplace task (original A2 uses
                      --workspace_shift only for pickplace, not standalone grasp)
 
@@ -1065,6 +1121,15 @@ def _predict_grasp_pose(
         action: 7D grasp pose [x, y, z, qx, qy, qz, qw] or None if failed
         info: Dict with additional info
     """
+    # Handle separate point clouds for GraspNet vs CLIP features
+    # This matches original A2: dense cloud for GraspNet, sparser with table filter for CLIP
+    if isinstance(pcd, tuple) and len(pcd) == 2:
+        pcd_graspnet, pcd_clip = pcd
+    else:
+        # Backward compatibility: use same cloud for both
+        pcd_graspnet = pcd
+        pcd_clip = pcd
+
     # Check if policy uses trained networks (direct_grounding=False)
     use_learned_networks = (
         hasattr(policy, "config")
@@ -1077,9 +1142,11 @@ def _predict_grasp_pose(
         batch = None
         try:
             # Build batch for internal method
+            # CRITICAL: Use dense cloud for GraspNet, sparser cloud for CLIP features
             batch = {
                 "task": lang_goal,
-                "point_cloud": torch.from_numpy(pcd).float().unsqueeze(0).to(device),
+                "point_cloud": torch.from_numpy(pcd_graspnet).float().unsqueeze(0).to(device),  # Dense for GraspNet
+                "point_cloud_clip": torch.from_numpy(pcd_clip).float().unsqueeze(0).to(device),  # Sparse for CLIP
                 "is_pickplace": is_pickplace,  # For workspace shift (only for pickplace)
             }
             # Pass target object poses for post-grasp filtering
@@ -1107,9 +1174,7 @@ def _predict_grasp_pose(
             policy._generate_grasp_target(batch)
             if hasattr(policy, "_target_pose") and policy._target_pose is not None:
                 grasp_pose = policy._target_pose.copy()
-                # Ensure minimum grasp z height for reliable grasping
-                if grasp_pose[2] < 0.025:
-                    grasp_pose[2] = 0.025
+                # Note: Don't enforce minimum z - original A2 grasps at z=0.002-0.016
                 return grasp_pose, {"source": "learned_networks"}
         except Exception as e:
             print(f"Warning: learned networks grasp failed: {e}")
@@ -1201,9 +1266,7 @@ def _predict_grasp_pose(
             policy._generate_grasp_target(batch)
             if hasattr(policy, "_target_pose") and policy._target_pose is not None:
                 grasp_pose = policy._target_pose.copy()
-                # Ensure minimum grasp z height for reliable grasping
-                if grasp_pose[2] < 0.025:
-                    grasp_pose[2] = 0.025
+                # Note: Don't enforce minimum z - original A2 grasps at z=0.002-0.016
                 return grasp_pose, {"source": "internal"}
         except Exception as e:
             print(f"Warning: _generate_grasp_target failed: {e}")

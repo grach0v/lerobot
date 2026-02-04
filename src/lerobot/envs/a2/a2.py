@@ -393,8 +393,14 @@ class A2Env(gym.Env):
             pose = action[:7]
 
             if self.task == "grasp":
-                success, grasped_obj_id, _ = self._env.grasp(pose)
-                reward = 1.0 if success and grasped_obj_id is not None else 0.0
+                grasp_success, grasped_obj_id, _ = self._env.grasp(pose)
+                # Success only if we grasped a TARGET object (matching original A2)
+                target_ids = self._env.target_obj_ids or []
+                success = grasp_success and grasped_obj_id in target_ids
+                reward = 1.0 if success else 0.0
+                # If we grasped wrong object, place it out of workspace
+                if grasp_success and not success:
+                    self._env.place_out_of_workspace()
             else:
                 success = self._env.place(pose)
                 reward = 1.0 if success else 0.0

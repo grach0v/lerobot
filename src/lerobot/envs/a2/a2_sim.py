@@ -474,12 +474,17 @@ class Environment:
         if self.gui:
             pb.configureDebugVisualizer(pb.COV_ENABLE_RENDERING, 0)
 
-        # Load workspace
+        # Set search path for workspace textures (plane.mtl, checkerboard.png)
+        pb.setAdditionalSearchPath(os.path.join(self._assets_root, "workspace"))
+
+        # Load ground plane (use absolute path since search path is for workspace)
+        plane_urdf = os.path.join(pybullet_data.getDataPath(), "plane.urdf")
         self.plane = pb.loadURDF(
-            "plane.urdf",
+            plane_urdf,
             basePosition=(0, 0, -0.0005),
             useFixedBase=True,
         )
+
         if workspace == "raw":
             workspace_urdf = os.path.join(self._assets_root, "workspace/workspace.urdf")
             self.workspace = pb.loadURDF(
@@ -511,6 +516,22 @@ class Environment:
             linearDamping=0.5,
             angularDamping=0.5,
         )
+
+        # Apply checkerboard texture to workspace for better visibility
+        checkerboard_path = os.path.join(self._assets_root, "workspace/checkerboard.png")
+        if os.path.exists(checkerboard_path):
+            try:
+                texture_id = pb.loadTexture(checkerboard_path, physicsClientId=self._client_id)
+                pb.changeVisualShape(
+                    self.workspace, -1,
+                    textureUniqueId=texture_id,
+                    physicsClientId=self._client_id
+                )
+                logger.info("Applied checkerboard texture to workspace")
+            except Exception as e:
+                logger.warning("Could not load checkerboard texture: %s", e)
+        else:
+            logger.warning("Checkerboard texture not found at %s", checkerboard_path)
 
         # Load UR5e
         ur5e_urdf = os.path.join(self._assets_root, "ur5e/ur5e.urdf")
