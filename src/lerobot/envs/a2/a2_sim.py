@@ -393,6 +393,33 @@ class Environment:
 
         pb.removeBody(obj_id)
 
+    def remove_out_of_workspace_objects(self, workspace_limits, exclude_ids=None):
+        """Remove rigid objects outside workspace limits.
+
+        Matches original A2 evaluator.py lines 623-630 and 636-644.
+
+        Args:
+            workspace_limits: np.array [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+            exclude_ids: Optional list of object IDs to never remove
+
+        Returns:
+            List of removed object IDs
+        """
+        exclude_ids = exclude_ids or []
+        removed = []
+        for obj_id in list(self.obj_ids["rigid"]):
+            if obj_id in exclude_ids:
+                continue
+            pos, _, _ = self.obj_info(obj_id)
+            # Check if outside X or Y bounds (Z is less critical for workspace validity)
+            if (pos[0] < workspace_limits[0][0] or pos[0] > workspace_limits[0][1] or
+                pos[1] < workspace_limits[1][0] or pos[1] > workspace_limits[1][1]):
+                self.remove_object_id(obj_id)
+                removed.append(obj_id)
+        if removed:
+            logger.info("Removed %d objects outside workspace", len(removed))
+        return removed
+
     def save_objects(self):
         """Save states of all rigid objects."""
         success = False
@@ -1094,13 +1121,13 @@ class Environment:
 
         return color, depth, segm
 
-    def get_multi_view_pointcloud(self, cameras=None, downsample=True, voxel_size=0.0015):
+    def get_multi_view_pointcloud(self, cameras=None, downsample=True, voxel_size=0.01):
         """Get fused point cloud from multiple cameras.
 
         Args:
             cameras: List of camera indices or None for first 3 cameras
             downsample: Whether to voxel downsample the point cloud
-            voxel_size: Voxel size for downsampling
+            voxel_size: Voxel size for downsampling (0.01m matches original A2)
 
         Returns:
             pcd: Open3D PointCloud with points and colors

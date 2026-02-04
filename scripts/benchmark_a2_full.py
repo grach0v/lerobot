@@ -44,6 +44,9 @@ from lerobot.envs.a2.a2_collect import (
     _predict_place_pose,
 )
 
+# Import workspace constants for object removal
+from lerobot.envs.a2.a2_constants import GRASP_WORKSPACE_LIMITS, PLACE_WORKSPACE_LIMITS
+
 
 @dataclass
 class CaseResult:
@@ -374,10 +377,20 @@ def setup_environment_from_test_case(env, test_case: dict, seed: int, task: str 
             ret = env._env.add_object_push_from_pickplace_file(file_path, mode="grasp")
             success, grasp_lang_goal, _ = ret
             if success:
+                # Remove objects outside grasp workspace (matching original A2 evaluator)
+                # Keep reference objects even if outside grasp workspace
+                ref_ids = getattr(env._env, "reference_obj_ids", [])
+                env._env.remove_out_of_workspace_objects(GRASP_WORKSPACE_LIMITS, exclude_ids=ref_ids)
+
                 # Then load place scene (adds place objects and sets up reference_obj_ids)
                 ret2 = env._env.add_object_push_from_pickplace_file(file_path, mode="place")
                 success2, _, place_lang_goal = ret2
                 if success2:
+                    # Remove place objects outside place workspace (matching original A2 evaluator)
+                    # Keep grasp objects (targets) even if outside place workspace
+                    target_ids = getattr(env._env, "target_obj_ids", [])
+                    env._env.remove_out_of_workspace_objects(PLACE_WORKSPACE_LIMITS, exclude_ids=target_ids)
+
                     result["lang_goal"] = grasp_lang_goal or test_case.get("lang_goal", "")
                     result["grasp_lang_goal"] = grasp_lang_goal
                     result["place_lang_goal"] = place_lang_goal

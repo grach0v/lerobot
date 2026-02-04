@@ -180,7 +180,7 @@ outputs/
 
 
 tmp*
-dataset_a2*
+dataset*
 asset_renders
 benchmark_*
 AGENTS.md

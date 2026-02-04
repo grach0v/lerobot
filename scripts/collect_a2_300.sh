@@ -11,14 +11,14 @@
 set -e
 
 # Configuration
-NUM_EPISODES=1000
+NUM_EPISODES=100
 MAX_ATTEMPTS=4
 NUM_OBJECTS=8
 FPS=30
 IMAGE_HEIGHT=480
 IMAGE_WIDTH=640
 DEVICE="cuda"
-OUTPUT_BASE="dataset_a2_1000"
+OUTPUT_BASE="dataset_a2_100"
 OBJECT_SET="train"  # "train" = seen objects, "test" = unseen objects
 # Environment reset interval to prevent GPU memory leak (PyBullet EGL leak)
 # Memory grows ~300-500MB per episode per process

@@ -575,6 +575,8 @@ def _collect_pose_mode(
             cleanup_gpu_memory()
             from lerobot.envs.a2.a2 import A2Env
 
+            # Recreate env with same camera settings as original
+            camera_mapping = {cam: cam for cam in cameras}
             env = A2Env(
                 task=env_task,
                 num_objects=env_num_objects,
@@ -582,6 +584,8 @@ def _collect_pose_mode(
                 gui=False,
                 observation_width=env_obs_width,
                 observation_height=env_obs_height,
+                camera_name=cameras,
+                camera_name_mapping=camera_mapping,
             )
             setup_frame_recorder(env)
             print("  [Memory cleanup] Environment recreated")
