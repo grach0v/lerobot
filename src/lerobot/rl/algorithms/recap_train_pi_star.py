@@ -19,10 +19,12 @@ Standalone training loop with an episode-level train/val split and validation
 metrics that measure how well the model differentiates positive vs negative
 advantage distributions.
 
-Advantages are **pre-computed** before the training loop starts using a frozen
-Pi0.5-based RECAPValueNetwork (PaliGemma backbone).  The value network runs
-once over the full dataset, then the advantage for each frame is injected into
-training/validation batches via a lookup dict keyed by absolute frame index.
+Per-frame advantages are read directly from the `recap_advantage` column of
+the source LeRobot dataset. The column is materialised by
+``examples/rtc/build_recap_policy_dataset.py``, which runs the trained value
+network once and writes `recap_advantage` (scalar) plus `advantage_condition`
+(binarized) back to a derived dataset. Inside the training loop we only need
+to pull the column into `batch["advantage"]`; no value network is loaded here.
 """
 
 import gc
@@ -33,6 +35,7 @@ import time as time_module
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -45,6 +48,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.policies.pistar06.modeling_pistar06 import PiStar06Policy
 from lerobot.rl.algorithms import recap_train_value_network as base
+from lerobot.rl.algorithms.recap_targets import RECAP_ADVANTAGE_SCORE_FEATURE
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS
 
 
@@ -65,10 +69,6 @@ class RECAPPiStarTrainingConfig:
 
     repo_id: str
     output_dir: str
-    value_network_checkpoint: str = ""
-    value_network_checkpoint_filename: str = "checkpoints/epoch_0001.pt"
-    value_network_pretrained_path: str | None = None
-    episode_labels_path: str | None = None
     root: str | None = None
     revision: str | None = None
     episodes: list[int] | None = None
@@ -92,15 +92,15 @@ class RECAPPiStarTrainingConfig:
     # text injection (baseline for ablation experiments).
     enable_advantage_conditioning: bool = True
 
-    # RECAP advantage conditioning
-    c_fail: float = 500.0
-    num_value_bins: int = 56
+    # RECAP advantage conditioning.  Per-frame advantages are read directly
+    # from the dataset's `recap_advantage` column -- no value-network
+    # inference happens in this script any more.
     # Per-frame advantage threshold: only frames with advantage > threshold get
     # "Advantage: positive" text.  The paper (Appendix A.4) sets this to a
     # per-task percentile so that ~30% of frames are positive during pre-training
     # and ~40% during fine-tuning.  Use advantage_threshold_percentile to compute
-    # this automatically from the advantage distribution; when set it overrides
-    # advantage_threshold after advantages are pre-computed.
+    # this automatically from the dataset's advantage distribution; when set it
+    # overrides advantage_threshold.
     advantage_threshold: float = 0.0
     advantage_threshold_percentile: float | None = 70.0
     advantage_dropout: float = 0.3
@@ -118,12 +118,6 @@ class RECAPPiStarTrainingConfig:
     train_expert_only: bool = False
     gradient_checkpointing: bool = False
     gradient_accumulation_steps: int = 1
-
-    # Value network pre-computation
-    vn_batch_size: int = 4
-
-    # Advantage caching (skip re-computation on subsequent runs)
-    advantage_cache_path: str | None = None
 
     # Weights & Biases (optional; set wandb_project to enable)
     wandb_project: str | None = None
@@ -147,159 +141,9 @@ def _init_wandb(cfg: RECAPPiStarTrainingConfig):
     return run
 
 
-def _resolve_value_network_checkpoint(cfg: RECAPPiStarTrainingConfig) -> str:
-    """Resolve value_network_checkpoint to a local file path.
-
-    If the path points to an existing local file it is returned as-is.
-    Otherwise the string is treated as a HuggingFace model repo ID
-    (e.g. ``jackvial/recap_value_0``) and the checkpoint file given by
-    ``value_network_checkpoint_filename`` is downloaded via ``hf_hub_download``.
-    """
-    local = Path(cfg.value_network_checkpoint).expanduser()
-    if local.is_file():
-        logging.info(f"Using local value-network checkpoint: {local}")
-        return str(local)
-
-    if local.is_absolute() or cfg.value_network_checkpoint.startswith((".", "~", "/")):
-        raise FileNotFoundError(
-            f"Value-network checkpoint path looks like a local path but does not exist: {local}"
-        )
-
-    from huggingface_hub import hf_hub_download
-
-    repo_id = cfg.value_network_checkpoint
-    filename = cfg.value_network_checkpoint_filename
-    logging.info(
-        f"Value-network checkpoint not found locally; "
-        f"downloading {filename} from HuggingFace repo '{repo_id}' ..."
-    )
-    local_path = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        repo_type="model",
-    )
-    logging.info(f"Downloaded value-network checkpoint to {local_path}")
-    return local_path
-
-
-def _resolve_pretrained_file(path_or_repo_id: str, filename: str) -> str:
-    """Resolve a file from a local directory or HuggingFace repo.
-
-    If ``path_or_repo_id`` is a local directory containing ``filename``,
-    return the local path.  Otherwise treat it as a HuggingFace model repo
-    ID and download the file.
-    """
-    local_dir = Path(path_or_repo_id).expanduser()
-    if local_dir.is_dir():
-        local_file = local_dir / filename
-        if local_file.is_file():
-            return str(local_file)
-        raise FileNotFoundError(
-            f"Local directory {local_dir} exists but is missing {filename}"
-        )
-
-    from huggingface_hub import hf_hub_download
-
-    logging.info(f"Downloading {filename} from HuggingFace repo '{path_or_repo_id}' ...")
-    return hf_hub_download(repo_id=path_or_repo_id, filename=filename, repo_type="model")
-
-
-def _load_value_network_from_pretrained(path_or_repo_id: str) -> "RECAPValueNetwork":
-    """Load a RECAPValueNetwork from a pretrained path (local dir or HF repo).
-
-    Expects the standard HuggingFace layout with ``config.json`` and
-    ``model.safetensors`` (as produced by ``push_value_network_to_hub.py``).
-    """
-    from dataclasses import fields as dc_fields
-
-    from safetensors.torch import load_file
-
-    from lerobot.rl.algorithms.recap_value_network import (
-        RECAPValueNetwork,
-        RECAPValueNetworkConfig,
-    )
-
-    config_path = _resolve_pretrained_file(path_or_repo_id, "config.json")
-    with open(config_path) as f:
-        config_dict = json.load(f)
-
-    valid_keys = {f.name for f in dc_fields(RECAPValueNetworkConfig)}
-    filtered = {k: v for k, v in config_dict.items() if k in valid_keys}
-    filtered["pretrained_path"] = None
-    config = RECAPValueNetworkConfig(**filtered)
-
-    model = RECAPValueNetwork(config)
-    weights_path = _resolve_pretrained_file(path_or_repo_id, "model.safetensors")
-    state_dict = load_file(weights_path)
-    model.load_state_dict(state_dict)
-    logging.info(
-        f"Loaded value network from pretrained path '{path_or_repo_id}': "
-        f"{sum(p.numel() for p in model.parameters()):,} params"
-    )
-    return model
-
-
-def _load_vn_train_config_from_pretrained(path_or_repo_id: str) -> dict:
-    """Load train_config.json from a pretrained value-network path or HF repo."""
-    try:
-        config_path = _resolve_pretrained_file(path_or_repo_id, "train_config.json")
-    except (FileNotFoundError, Exception):
-        logging.warning(
-            f"Could not find train_config.json in '{path_or_repo_id}'; "
-            "cannot auto-resolve c_fail / num_value_bins."
-        )
-        return {}
-    with open(config_path) as f:
-        train_cfg = json.load(f)
-    logging.info(f"Loaded VN train config from pretrained path '{path_or_repo_id}'")
-    return train_cfg
-
-
-def _resolve_labels_csv(cfg: RECAPPiStarTrainingConfig) -> Path:
-    """Resolve the episode labels CSV path, reusing the value-network logic."""
-    if cfg.episode_labels_path is not None:
-        resolved = Path(cfg.episode_labels_path).expanduser()
-        if not resolved.is_file():
-            raise FileNotFoundError(f"Provided --episode_labels_path does not exist: {resolved}")
-        return resolved
-
-    from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME
-
-    dataset_root = Path(cfg.root) / cfg.repo_id if cfg.root else HF_LEROBOT_HOME / cfg.repo_id
-    default_path = dataset_root / "meta" / "episode_labels.csv"
-    if default_path.is_file():
-        return default_path
-
-    try:
-        from huggingface_hub import hf_hub_download
-
-        logging.info(
-            f"Episode labels not found locally at {default_path}; "
-            f"attempting to download from {cfg.repo_id} ..."
-        )
-        hf_hub_download(
-            repo_id=cfg.repo_id,
-            filename="meta/episode_labels.csv",
-            repo_type="dataset",
-            revision=cfg.revision,
-            local_dir=str(dataset_root),
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
-    if default_path.is_file():
-        return default_path
-
-    raise FileNotFoundError(
-        f"No episode labels CSV found at {default_path}\n"
-        "Either push meta/episode_labels.csv to your dataset or pass --episode_labels_path."
-    )
-
-
 def _build_policy_config(
     cfg: RECAPPiStarTrainingConfig,
     train_dataset: LeRobotDataset,
-    labels_csv_path: Path,
 ):
     """Build a PiStar06Config from the training config and dataset metadata."""
     from lerobot.policies.pistar06.configuration_pistar06 import PiStar06Config
@@ -318,8 +162,6 @@ def _build_policy_config(
         freeze_vision_encoder=cfg.freeze_vision_encoder,
         train_expert_only=cfg.train_expert_only,
         gradient_checkpointing=cfg.gradient_checkpointing,
-        episode_labels_path=str(labels_csv_path),
-        c_fail=cfg.c_fail,
         advantage_threshold=cfg.advantage_threshold,
         advantage_dropout=cfg.advantage_dropout,
         cfg_beta=cfg.cfg_beta,
@@ -382,202 +224,43 @@ def _restore_freeze_state(policy, cfg: RECAPPiStarTrainingConfig) -> None:
             layer.train()
 
 
-# ── Advantage pre-computation ────────────────────────────────────────────────
+# ── Advantage handling ───────────────────────────────────────────────────────
 
 
-def _make_vn_preprocessor(policy_cfg, dataset_stats):
-    """Build a lightweight preprocessor for VN advantage precomputation.
-
-    Omits DeviceProcessorStep (VN handles device transfer internally) and
-    AddBatchDimensionProcessorStep (DataLoader already batches).
-    """
-    from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
-    from lerobot.processor import (
-        NormalizerProcessorStep,
-        PolicyProcessorPipeline,
-        TokenizerProcessorStep,
-    )
-
-    steps = [
-        NormalizerProcessorStep(
-            features={**policy_cfg.input_features, **policy_cfg.output_features},
-            norm_map=policy_cfg.normalization_mapping,
-            stats=dataset_stats,
-        ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=policy_cfg.max_state_dim),
-        TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
-            max_length=policy_cfg.tokenizer_max_length,
-            padding_side="right",
-            padding="max_length",
-        ),
-    ]
-    return PolicyProcessorPipeline(steps=steps, name="vn_preprocessor")
-
-
-@torch.no_grad()
-def _precompute_advantages(
-    full_dataset: LeRobotDataset,
-    frame_targets: list[base.FrameTarget],
-    value_network_checkpoint: str | None,
-    policy_cfg,
-    device: torch.device,
-    batch_size: int = 4,
-    value_network: "RECAPValueNetwork | None" = None,
-) -> tuple[dict[int, float], dict[int, int]]:
-    """Pre-compute per-frame advantages using the frozen value network.
-
-    Builds a lightweight preprocessor internally that produces only the
-    fields consumed by ``RECAPValueNetwork`` (language tokens + images),
-    without moving every tensor to GPU.
-
-    The value network can be provided directly via ``value_network`` (e.g.
-    loaded from a pretrained HF repo), or loaded from a legacy ``.pt``
-    checkpoint via ``value_network_checkpoint``.
-    """
-    from lerobot.rl.algorithms.recap_utils import collect_images
-    from lerobot.rl.algorithms.recap_value_network import (
-        RECAPValueNetwork,
-        RECAPValueNetworkConfig,
-    )
-
-    preprocessor = _make_vn_preprocessor(policy_cfg, full_dataset.meta.stats)
-
-    if value_network is not None:
-        vn = value_network
-    elif value_network_checkpoint is not None:
-        logging.info(f"Loading value network from {value_network_checkpoint}")
-        checkpoint = torch.load(value_network_checkpoint, map_location="cpu", weights_only=False)
-        vn_config = RECAPValueNetworkConfig(**checkpoint["model_config"])
-        vn = RECAPValueNetwork(vn_config)
-        vn.load_state_dict(checkpoint["model_state_dict"])
-        del checkpoint
-        gc.collect()
-    else:
+def _require_advantage_column(dataset: LeRobotDataset) -> None:
+    """Verify the dataset carries the precomputed `recap_advantage` scalar column."""
+    if RECAP_ADVANTAGE_SCORE_FEATURE not in dataset.meta.features:
         raise ValueError(
-            "Either value_network or value_network_checkpoint must be provided"
+            f"Dataset is missing the '{RECAP_ADVANTAGE_SCORE_FEATURE}' column.\n"
+            "Run `python examples/rtc/build_recap_policy_dataset.py` over the RECAP "
+            "dataset to score frames with the trained value network and materialise "
+            "advantages."
         )
 
-    vn.eval()
-    vn.to(device)
-    for param in vn.parameters():
-        param.requires_grad = False
-    logging.info(
-        f"Value network loaded: {sum(p.numel() for p in vn.parameters()):,} params"
-    )
-    _log_memory("post-VN-load")
 
-    full_dataset._ensure_hf_dataset_loaded()
-    R_t_by_abs_index: dict[int, float] = {}
-    for ft in frame_targets:
-        abs_idx = int(full_dataset.hf_dataset[ft.frame_index]["index"])
-        R_t_by_abs_index[abs_idx] = ft.target_value
-
-    loader = DataLoader(
-        full_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        drop_last=False,
+def _dataset_advantage_values(dataset: LeRobotDataset) -> np.ndarray:
+    """Return the full `recap_advantage` scalar column as a numpy array."""
+    _require_advantage_column(dataset)
+    dataset._ensure_hf_dataset_loaded()
+    return (
+        np.asarray(dataset.hf_dataset[RECAP_ADVANTAGE_SCORE_FEATURE])
+        .astype(np.float32)
+        .reshape(-1)
     )
 
-    advantage_lookup: dict[int, float] = {}
-    episode_lookup: dict[int, int] = {}
-    total_frames = 0
 
-    for batch in loader:
-        abs_indices = batch["index"]
-        ep_indices = batch["episode_index"]
-        B = abs_indices.shape[0]
+def _compute_advantage_threshold(advantages: np.ndarray, percentile: float) -> float:
+    """Nth-percentile threshold over all per-frame advantages.
 
-        batch = preprocessor(batch)
-        images = collect_images(batch, vn.config.image_size)
-        outputs = vn(batch, images)
-        V_t = outputs["expected_value"].squeeze(-1).cpu()
-
-        for i in range(B):
-            abs_idx = int(abs_indices[i].item())
-            R_t = R_t_by_abs_index.get(abs_idx)
-            if R_t is not None:
-                advantage_lookup[abs_idx] = R_t - V_t[i].item()
-                episode_lookup[abs_idx] = int(ep_indices[i].item())
-
-        total_frames += B
-        if total_frames % 500 == 0:
-            logging.info(f"  Pre-computed advantages for {total_frames}/{len(full_dataset)} frames")
-
-    logging.info(
-        f"Advantage pre-computation complete: {len(advantage_lookup)} frames, "
-        f"mean={sum(advantage_lookup.values()) / max(1, len(advantage_lookup)):.4f}"
-    )
-
-    del vn, preprocessor
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return advantage_lookup, episode_lookup
-
-
-def _save_advantage_cache(
-    path: str | Path,
-    advantage_lookup: dict[int, float],
-    episode_lookup: dict[int, int] | None = None,
-    metadata: dict | None = None,
-) -> None:
-    """Save pre-computed advantages to a JSON file for reuse across runs."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "advantages": {str(k): v for k, v in advantage_lookup.items()},
-        "num_frames": len(advantage_lookup),
-        "mean_advantage": sum(advantage_lookup.values()) / max(1, len(advantage_lookup)),
-    }
-    if episode_lookup is not None:
-        payload["episode_labels"] = {str(k): v for k, v in episode_lookup.items()}
-    if metadata:
-        payload["metadata"] = metadata
-    with open(path, "w") as f:
-        json.dump(payload, f)
-    logging.info(f"Saved advantage cache ({len(advantage_lookup)} frames) to {path}")
-
-
-def _load_advantage_cache(path: str | Path) -> tuple[dict[int, float], dict[int, int] | None]:
-    """Load pre-computed advantages from a JSON cache file."""
-    path = Path(path)
-    with open(path) as f:
-        payload = json.load(f)
-    lookup = {int(k): float(v) for k, v in payload["advantages"].items()}
-    episode_lookup = None
-    if "episode_labels" in payload:
-        episode_lookup = {int(k): int(v) for k, v in payload["episode_labels"].items()}
-    logging.info(
-        f"Loaded advantage cache from {path}: {len(lookup)} frames, "
-        f"mean={sum(lookup.values()) / max(1, len(lookup)):.4f}"
-    )
-    return lookup, episode_lookup
-
-
-def _compute_advantage_threshold(
-    advantage_lookup: dict[int, float],
-    percentile: float,
-) -> float:
-    """Compute an advantage threshold from the Nth percentile of the distribution.
-
-    Following the paper (Appendix A.4): during pre-training the threshold is set
-    so that ~30% of frames are positive (percentile=70); during fine-tuning ~40%
-    are positive (percentile=60).
+    Following the paper (Appendix A.4): pre-training uses percentile=70 (~30%
+    positive); fine-tuning uses percentile=60 (~40% positive).
     """
-    import numpy as np
-
-    values = np.array(list(advantage_lookup.values()))
-    threshold = float(np.percentile(values, percentile))
-    pct_positive = float((values > threshold).sum()) / len(values) * 100
-
+    threshold = float(np.percentile(advantages, percentile))
+    pct_positive = float((advantages > threshold).sum()) / max(1, advantages.size) * 100
     logging.info(
-        f"Advantage distribution ({len(values)} frames): "
-        f"mean={values.mean():.5f} std={values.std():.5f} "
-        f"min={values.min():.5f} max={values.max():.5f}"
+        f"Advantage distribution ({advantages.size} frames): "
+        f"mean={advantages.mean():.5f} std={advantages.std():.5f} "
+        f"min={advantages.min():.5f} max={advantages.max():.5f}"
     )
     logging.info(
         f"Auto-threshold from {percentile:.0f}th percentile: {threshold:.5f} "
@@ -586,45 +269,62 @@ def _compute_advantage_threshold(
     return threshold
 
 
-def _load_vn_train_config(checkpoint_path: str) -> dict:
-    """Load the value-network training config.
+def _build_frame_targets_for_pistar(dataset: LeRobotDataset) -> list[base.FrameTarget]:
+    """Enumerate frames for the train/val split.
 
-    Tries ``train_config.json`` next to the checkpoint first (lightweight).
-    Falls back to loading the full checkpoint only if the JSON is missing.
+    Pistar training only needs per-frame episode identity + success to split the
+    dataset; the value-bin / target-value fields on `FrameTarget` are ignored.
+    This bypasses the value-network trainer's stricter RECAP-column requirement.
     """
-    ckpt_path = Path(checkpoint_path)
-    json_path = ckpt_path.parent.parent / "train_config.json"
-    if json_path.is_file():
-        with open(json_path) as f:
-            train_cfg = json.load(f)
-        logging.info(f"Loaded VN train config from {json_path}")
-        return train_cfg
+    from lerobot.rl.algorithms.recap_targets import EPISODE_SUCCESS_FEATURE
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    train_cfg = ckpt.get("train_config", {})
-    del ckpt
-    gc.collect()
-    if not train_cfg:
-        logging.warning(
-            "Value-network checkpoint does not contain a 'train_config' entry; "
-            "cannot auto-resolve c_fail / num_value_bins."
+    episode_infos = base._build_episode_infos(dataset)
+    dataset._ensure_hf_dataset_loaded()
+    hf_dataset = dataset.hf_dataset
+    episode_index_col = np.asarray(hf_dataset["episode_index"])
+
+    if EPISODE_SUCCESS_FEATURE in dataset.meta.features:
+        success_col = (
+            np.asarray(hf_dataset[EPISODE_SUCCESS_FEATURE]).astype(np.float32).reshape(-1)
         )
-    return train_cfg
+    else:
+        success_col = None
+
+    frame_targets: list[base.FrameTarget] = []
+    for rel_idx in range(len(hf_dataset)):
+        ep_idx = int(episode_index_col[rel_idx])
+        if ep_idx not in episode_infos:
+            continue
+        info = episode_infos[ep_idx]
+        success_flag = int(success_col[rel_idx] > 0.5) if success_col is not None else 0
+        frame_targets.append(
+            base.FrameTarget(
+                frame_index=rel_idx,
+                episode_index=ep_idx,
+                success=success_flag,
+                task=info.task,
+                target_value=0.0,
+                target_bin=0,
+            )
+        )
+    if not frame_targets:
+        raise ValueError("No frame targets found for pistar training.")
+    return frame_targets
 
 
-def _inject_advantages(
-    batch: dict,
-    advantage_lookup: dict[int, float],
-    device: torch.device,
-) -> dict:
-    """Inject pre-computed advantages into a batch dict."""
-    abs_indices = batch["index"]
-    advantages = torch.tensor(
-        [advantage_lookup.get(int(idx.item()), 0.0) for idx in abs_indices],
-        dtype=torch.float32,
-        device=device,
-    )
-    batch["advantage"] = advantages
+def _inject_advantages(batch: dict, device: torch.device) -> dict:
+    """Copy the `recap_advantage` column straight from the batch into `batch['advantage']`."""
+    if RECAP_ADVANTAGE_SCORE_FEATURE not in batch:
+        raise KeyError(
+            f"Batch is missing the '{RECAP_ADVANTAGE_SCORE_FEATURE}' column. Ensure the "
+            "source dataset was built with build_recap_policy_dataset.py."
+        )
+    advantages = batch[RECAP_ADVANTAGE_SCORE_FEATURE]
+    if not torch.is_tensor(advantages):
+        advantages = torch.as_tensor(advantages, dtype=torch.float32)
+    else:
+        advantages = advantages.to(dtype=torch.float32)
+    batch["advantage"] = advantages.reshape(-1).to(device=device)
     return batch
 
 
@@ -636,7 +336,6 @@ def _run_validation(
     policy,
     loader: DataLoader,
     preprocessor,
-    advantage_lookup: dict[int, float],
     device: torch.device,
     max_steps: int | None = None,
 ) -> dict[str, float]:
@@ -647,8 +346,10 @@ def _run_validation(
       Pass 2 -- flipped advantage embedding  -> per-sample loss_wrong
     Both passes share identical noise and flow time for fair comparison.
     """
+    from lerobot.rl.algorithms.recap_targets import EPISODE_SUCCESS_FEATURE
+
     policy.eval()
-    has_episode_info = policy._episode_info is not None
+    has_episode_info = False
 
     total_loss = 0.0
     total_loss_pos = 0.0
@@ -692,7 +393,7 @@ def _run_validation(
             break
 
         batch = preprocessor(batch)
-        batch = _inject_advantages(batch, advantage_lookup, device)
+        batch = _inject_advantages(batch, device)
 
         advantages, _ = policy._compute_advantages(batch)
         true_indicator = advantages > policy.config.advantage_threshold
@@ -701,13 +402,12 @@ def _run_validation(
 
         B = batch[OBS_LANGUAGE_TOKENS].shape[0]
 
-        if has_episode_info:
-            ep_indices = batch["episode_index"]
-            episode_success = torch.tensor(
-                [policy._episode_info[int(idx)]["success"] for idx in ep_indices],
-                device=device,
-                dtype=torch.bool,
-            )
+        episode_success_raw = batch.get(EPISODE_SUCCESS_FEATURE)
+        if episode_success_raw is not None:
+            has_episode_info = True
+            if not torch.is_tensor(episode_success_raw):
+                episode_success_raw = torch.as_tensor(episode_success_raw, device=device)
+            episode_success = (episode_success_raw.reshape(-1).to(device=device) > 0.5)
             adv_positive = advantages > policy.config.advantage_threshold
             aligned = (adv_positive == episode_success).float()
             total_aligned += aligned.sum().item()
@@ -858,58 +558,16 @@ def run_recap_pistar_train_val(cfg: RECAPPiStarTrainingConfig) -> None:
         episodes=cfg.episodes,
     )
 
-    labels_csv_path = _resolve_labels_csv(cfg)
-    logging.info(f"Using episode labels from: {labels_csv_path}")
-    success_by_episode = base._load_episode_success_map(labels_csv_path)
-
     if cfg.enable_advantage_conditioning:
-        use_pretrained_vn = cfg.value_network_pretrained_path is not None
-        if not use_pretrained_vn and not cfg.value_network_checkpoint:
-            raise ValueError(
-                "Either value_network_pretrained_path or value_network_checkpoint "
-                "is required when enable_advantage_conditioning=True"
-            )
-
-        if use_pretrained_vn:
-            vn_train_cfg = _load_vn_train_config_from_pretrained(
-                cfg.value_network_pretrained_path
-            )
-            resolved_vn_checkpoint = None
-        else:
-            resolved_vn_checkpoint = _resolve_value_network_checkpoint(cfg)
-            vn_train_cfg = _load_vn_train_config(resolved_vn_checkpoint)
-
-        # Pull c_fail / num_value_bins from the value-network config so
-        # the return targets used here are guaranteed to match those used
-        # during value-network training.
-        if vn_train_cfg:
-            vn_c_fail = vn_train_cfg.get("c_fail")
-            vn_num_value_bins = vn_train_cfg.get("num_value_bins")
-            if vn_c_fail is not None and vn_c_fail != cfg.c_fail:
-                logging.warning(
-                    f"Overriding c_fail from {cfg.c_fail} -> {vn_c_fail} "
-                    f"to match value-network checkpoint"
-                )
-                cfg.c_fail = float(vn_c_fail)
-            if vn_num_value_bins is not None and vn_num_value_bins != cfg.num_value_bins:
-                logging.warning(
-                    f"Overriding num_value_bins from {cfg.num_value_bins} -> {vn_num_value_bins} "
-                    f"to match value-network checkpoint"
-                )
-                cfg.num_value_bins = int(vn_num_value_bins)
+        _require_advantage_column(full_dataset)
     else:
         logging.info(
             "Advantage conditioning DISABLED — training vanilla Pi0.5 "
-            "(no value network, no advantage text injection)"
+            "(no advantage text injection). `recap_advantage` column is not required."
         )
         cfg.advantage_dropout = 1.0
 
-    frame_targets = base._build_frame_targets(
-        dataset=full_dataset,
-        success_by_episode=success_by_episode,
-        c_fail=cfg.c_fail,
-        num_value_bins=cfg.num_value_bins,
-    )
+    frame_targets = _build_frame_targets_for_pistar(full_dataset)
     train_targets, val_targets = base._split_train_val_targets(
         frame_targets=frame_targets,
         val_ratio=cfg.val_split_ratio,
@@ -924,50 +582,15 @@ def run_recap_pistar_train_val(cfg: RECAPPiStarTrainingConfig) -> None:
     )
 
     # ── 2. Build policy config and preprocessor ────────────────────────────
-    policy_cfg = _build_policy_config(cfg, full_dataset, labels_csv_path)
+    policy_cfg = _build_policy_config(cfg, full_dataset)
     _log_memory("post-dataset-split")
 
-    # ── 3. Pre-compute advantages using Pi0.5-based value network ────────
+    # ── 3. Resolve advantage threshold from the dataset column ─────────────
     if cfg.enable_advantage_conditioning:
-        cache_path = Path(cfg.advantage_cache_path) if cfg.advantage_cache_path else None
-        if cache_path is not None and cache_path.is_file():
-            advantage_lookup, _ = _load_advantage_cache(cache_path)
-        else:
-            vn_model = None
-            if use_pretrained_vn:
-                vn_model = _load_value_network_from_pretrained(
-                    cfg.value_network_pretrained_path
-                )
-
-            advantage_lookup, episode_lookup = _precompute_advantages(
-                full_dataset=full_dataset,
-                frame_targets=frame_targets,
-                value_network_checkpoint=resolved_vn_checkpoint,
-                policy_cfg=policy_cfg,
-                device=device,
-                batch_size=cfg.vn_batch_size,
-                value_network=vn_model,
-            )
-
-            vn_source = cfg.value_network_pretrained_path or resolved_vn_checkpoint
-            if cache_path is not None:
-                _save_advantage_cache(
-                    cache_path,
-                    advantage_lookup,
-                    episode_lookup=episode_lookup,
-                    metadata={
-                        "value_network_checkpoint": vn_source,
-                        "c_fail": cfg.c_fail,
-                        "repo_id": cfg.repo_id,
-                        "success_by_episode": success_by_episode
-                    },
-                )
-        _log_memory("post-advantage-precompute")
-
-        # ── 3b. Auto-compute advantage threshold from percentile ─────────
+        advantages_all = _dataset_advantage_values(full_dataset)
         if cfg.advantage_threshold_percentile is not None:
             cfg.advantage_threshold = _compute_advantage_threshold(
-                advantage_lookup, cfg.advantage_threshold_percentile
+                advantages_all, cfg.advantage_threshold_percentile
             )
             policy_cfg.advantage_threshold = cfg.advantage_threshold
         else:
@@ -976,8 +599,7 @@ def run_recap_pistar_train_val(cfg: RECAPPiStarTrainingConfig) -> None:
                 f"(advantage_threshold_percentile is None)"
             )
     else:
-        advantage_lookup: dict[int, float] = {}
-        logging.info("Skipping advantage pre-computation (advantage conditioning disabled)")
+        logging.info("Skipping advantage threshold computation (advantage conditioning disabled)")
 
     # ── 4. Create separate datasets for train and val ────────────────────
     delta_timestamps = resolve_delta_timestamps(policy_cfg, full_dataset.meta)
@@ -1159,7 +781,7 @@ def run_recap_pistar_train_val(cfg: RECAPPiStarTrainingConfig) -> None:
                 break
 
             batch = preprocessor(batch)
-            batch = _inject_advantages(batch, advantage_lookup, device)
+            batch = _inject_advantages(batch, device)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 loss, output_dict = policy.forward(batch)
@@ -1211,7 +833,7 @@ def run_recap_pistar_train_val(cfg: RECAPPiStarTrainingConfig) -> None:
                     else cfg.max_val_steps_per_epoch
                 )
                 step_val_metrics = _run_validation(
-                    policy, step_val_loader, preprocessor, advantage_lookup,
+                    policy, step_val_loader, preprocessor,
                     device, max_steps=step_val_max
                 )
                 tag = (
@@ -1238,7 +860,7 @@ def run_recap_pistar_train_val(cfg: RECAPPiStarTrainingConfig) -> None:
         # End-of-epoch validation
         try:
             val_metrics = _run_validation(
-                policy, val_loader, preprocessor, advantage_lookup,
+                policy, val_loader, preprocessor,
                 device, max_steps=cfg.max_val_steps_per_epoch
             )
         except Exception as error:  # noqa: BLE001
@@ -1250,7 +872,7 @@ def run_recap_pistar_train_val(cfg: RECAPPiStarTrainingConfig) -> None:
             )
             try:
                 val_metrics = _run_validation(
-                    policy, step_val_loader, preprocessor, advantage_lookup,
+                    policy, step_val_loader, preprocessor,
                     device, max_steps=cfg.max_val_steps_per_epoch,
                 )
             except Exception as retry_error:  # noqa: BLE001

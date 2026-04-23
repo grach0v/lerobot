@@ -29,35 +29,26 @@ class PiStar06Config(PI05Config):
     advantage directly into the action expert's input pathway (embed_suffix).
     """
 
-    # Frozen value network checkpoint (path to .pt file from RECAP training)
-    value_network_checkpoint: str | None = None
-
-    # Master switch for advantage conditioning.  When False the policy
-    # behaves like vanilla Pi0.5 (no advantage text is injected during
-    # training or inference).  Persisted in config.json so inference
-    # automatically matches the training regime.
+    # Master switch for advantage conditioning. When False the policy behaves
+    # like vanilla Pi0.5 (no advantage text is injected during training or
+    # inference). Persisted in config.json so inference automatically matches
+    # the training regime.
     enable_advantage_conditioning: bool = True
 
     # Advantage conditioning -- threshold controls which frames get
     # "Advantage: positive" text (advantage > threshold).  The paper sets this
     # to a per-task percentile (~30% positive in pre-training, ~40% in
-    # fine-tuning).  In the training script this is auto-computed from the
-    # advantage distribution via advantage_threshold_percentile; the value here
-    # is the resolved scalar used at runtime.
+    # fine-tuning). The training script auto-computes this from the dataset's
+    # recap_advantage column via advantage_threshold_percentile; the value
+    # stored here is the resolved scalar used at runtime.
     advantage_threshold: float = 0.0
     advantage_dropout: float = 0.3
 
-    # Action expert layer truncation (0 = use all layers from the variant)
+    # Action expert layer truncation (0 = use all layers from the variant).
     num_expert_layers: int = 0
 
-    # Return computation (must match the c_fail used to train the value network)
-    c_fail: float = 500.0
-
-    # Classifier-free guidance scale (1.0 = no CFG, >1.0 = sharpen with CFG)
+    # Classifier-free guidance scale (1.0 = no CFG, >1.0 = sharpen with CFG).
     cfg_beta: float = 1.0
 
-    # Episode labels CSV for on-the-fly return computation
-    episode_labels_path: str | None = None
-
-    # PaliGemma tokenizer (shared across all PaliGemma model sizes)
+    # PaliGemma tokenizer (shared across all PaliGemma model sizes).
     paligemma_tokenizer_name: str = "google/paligemma-3b-pt-224"

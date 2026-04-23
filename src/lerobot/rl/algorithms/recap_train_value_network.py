@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch.utils.data import DataLoader, Dataset
@@ -39,13 +38,14 @@ from torch.utils.data import DataLoader, Dataset
 from lerobot.configs import parser
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
-from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.rl.algorithms.recap_targets import (
+    EPISODE_SUCCESS_FEATURE,
+    RECAP_NORMALIZED_RETURN_FEATURE,
+    RECAP_VALUE_TARGET_FEATURE,
+)
 from lerobot.rl.algorithms.recap_utils import collect_images
 from lerobot.rl.algorithms.recap_value_network import RECAPValueNetwork, RECAPValueNetworkConfig
-
-CSV_EPISODE_INDEX_COLUMN = "episode_index"
-CSV_SUCCESS_COLUMN = "success"
-DEFAULT_EPISODE_LABELS_FILENAME = "meta/episode_labels.csv"
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,6 @@ class RECAPValueTrainingConfig:
 
     repo_id: str
     output_dir: str
-    labels_csv_path: str | None = None
     root: str | None = None
     revision: str | None = None
     episodes: list[int] | None = None
@@ -200,78 +199,22 @@ def _is_known_video_validation_error(error: Exception) -> bool:
     )
 
 
-def _load_episode_success_map(labels_csv_path: Path) -> dict[int, int]:
-    labels_df = pd.read_csv(labels_csv_path)
-    missing_columns = [
-        column
-        for column in (CSV_EPISODE_INDEX_COLUMN, CSV_SUCCESS_COLUMN)
-        if column not in labels_df.columns
-    ]
-    if missing_columns:
+def _require_recap_columns(dataset: LeRobotDataset) -> None:
+    """Verify the dataset carries the precomputed RECAP target columns."""
+    required = {
+        EPISODE_SUCCESS_FEATURE,
+        RECAP_NORMALIZED_RETURN_FEATURE,
+        RECAP_VALUE_TARGET_FEATURE,
+    }
+    missing = sorted(required - set(dataset.meta.features))
+    if missing:
         raise ValueError(
-            f"CSV {labels_csv_path} is missing required columns: {missing_columns}. "
-            f"Expected schema: [{CSV_EPISODE_INDEX_COLUMN}, {CSV_SUCCESS_COLUMN}]"
+            f"Dataset is missing required RECAP columns: {missing}.\n"
+            "Either record with examples/rtc/record_recap_with_real_robot.py or run\n"
+            "    python examples/rtc/label_recap_episodes.py  # writes episode_success\n"
+            "    python examples/rtc/build_recap_dataset.py   # writes recap_reward / return / value_target\n"
+            "to materialise them from raw success labels."
         )
-
-    success_map: dict[int, int] = {}
-    for _, row in labels_df.iterrows():
-        episode_index = _to_int(row[CSV_EPISODE_INDEX_COLUMN])
-        success = _to_int(row[CSV_SUCCESS_COLUMN])
-        if success not in (0, 1):
-            raise ValueError(
-                f"CSV success labels must be 0/1. Found {success} for episode_index={episode_index}."
-            )
-        success_map[episode_index] = success
-    return success_map
-
-
-def _resolve_labels_csv_path(cfg: RECAPValueTrainingConfig) -> Path:
-    """Return the path to the episode-labels CSV.
-
-    When ``labels_csv_path`` is provided explicitly, that path is used directly.
-    Otherwise the file is expected at ``<dataset_root>/meta/episode_labels.csv``.
-
-    If the file isn't in the local cache yet (e.g. the dataset was cached before
-    the labels were pushed), the resolver attempts to download it from HuggingFace.
-    """
-    if cfg.labels_csv_path is not None:
-        resolved = Path(cfg.labels_csv_path).expanduser()
-        if not resolved.is_file():
-            raise FileNotFoundError(f"Provided --labels_csv_path does not exist: {resolved}")
-        return resolved
-
-    dataset_root = Path(cfg.root) / cfg.repo_id if cfg.root else HF_LEROBOT_HOME / cfg.repo_id
-    default_path = dataset_root / DEFAULT_EPISODE_LABELS_FILENAME
-    if default_path.is_file():
-        return default_path
-
-    # The local cache may predate the labels upload — try fetching the file.
-    try:
-        from huggingface_hub import hf_hub_download
-
-        logging.info(
-            f"Episode labels not found locally at {default_path}; "
-            f"attempting to download from {cfg.repo_id} ..."
-        )
-        hf_hub_download(
-            repo_id=cfg.repo_id,
-            filename=DEFAULT_EPISODE_LABELS_FILENAME,
-            repo_type="dataset",
-            revision=cfg.revision,
-            local_dir=str(dataset_root),
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
-    if default_path.is_file():
-        return default_path
-
-    raise FileNotFoundError(
-        f"No episode labels CSV found at the default location: {default_path}\n"
-        "Either:\n"
-        "  1. Push a labels CSV to your HuggingFace dataset under meta/episode_labels.csv, or\n"
-        "  2. Pass --labels_csv_path explicitly."
-    )
 
 
 def _selected_episode_indices(dataset: LeRobotDataset) -> list[int]:
@@ -316,75 +259,65 @@ def _build_episode_infos(dataset: LeRobotDataset) -> dict[int, EpisodeInfo]:
     return episode_infos
 
 
-def _compute_task_max_episode_len(episode_infos: dict[int, EpisodeInfo]) -> dict[str, int]:
-    by_task: dict[str, int] = {}
-    for info in episode_infos.values():
-        by_task[info.task] = max(by_task.get(info.task, 1), info.length)
-    return by_task
-
-
-def _discretize_values(normalized_returns: torch.Tensor, num_value_bins: int) -> torch.Tensor:
-    bin_edges = torch.linspace(
-        -1.0,
-        0.0,
-        num_value_bins + 1,
-        dtype=normalized_returns.dtype,
-        device=normalized_returns.device,
-    )
-    bin_ids = torch.bucketize(normalized_returns, bin_edges[1:], right=False)
-    return bin_ids.clamp(min=0, max=num_value_bins - 1).to(torch.long)
-
-
 def _build_frame_targets(
     dataset: LeRobotDataset,
-    success_by_episode: dict[int, int],
     c_fail: float,
     num_value_bins: int,
 ) -> list[FrameTarget]:
+    """Read precomputed RECAP targets directly from dataset columns.
+
+    The dataset must already carry `episode_success`, `recap_normalized_return`,
+    and `recap_value_target_bin`. Those columns are written by the recording
+    script or by `examples/rtc/build_recap_dataset.py`. `c_fail` and
+    `num_value_bins` are kept on the config so they are preserved in the
+    training checkpoint (the value head size depends on them at inference time),
+    but they do not drive any computation in this function — the dataset is
+    authoritative.
+    """
+    _ = (c_fail,)  # kept for checkpoint metadata; no longer used to build targets.
+
+    _require_recap_columns(dataset)
     episode_infos = _build_episode_infos(dataset)
-    task_max_episode_len = _compute_task_max_episode_len(episode_infos)
 
     dataset._ensure_hf_dataset_loaded()
-    abs_to_rel_idx: dict[int, int] = {}
-    for rel_idx in range(len(dataset.hf_dataset)):
-        row = dataset.hf_dataset[rel_idx]
-        abs_index = _to_int(row["index"])
-        abs_to_rel_idx[abs_index] = rel_idx
+    hf_dataset = dataset.hf_dataset
+    episode_index_col = np.asarray(hf_dataset["episode_index"])
 
-    missing_episode_labels = sorted(set(episode_infos) - set(success_by_episode))
-    if missing_episode_labels:
+    success_col = np.asarray(hf_dataset[EPISODE_SUCCESS_FEATURE]).astype(np.float32).reshape(-1)
+    target_value_col = (
+        np.asarray(hf_dataset[RECAP_NORMALIZED_RETURN_FEATURE]).astype(np.float32).reshape(-1)
+    )
+    target_bin_col = np.asarray(hf_dataset[RECAP_VALUE_TARGET_FEATURE]).astype(np.int64).reshape(-1)
+
+    max_observed_bin = int(target_bin_col.max()) if target_bin_col.size else 0
+    if max_observed_bin >= num_value_bins:
         raise ValueError(
-            f"CSV is missing success labels for episode indices: {missing_episode_labels[:20]}"
+            f"Dataset was built with more than {num_value_bins} value bins "
+            f"(observed bin id {max_observed_bin}). Rebuild with matching --num-bins "
+            "or raise --num_value_bins to match."
         )
 
     frame_targets: list[FrameTarget] = []
-    for ep_idx, info in episode_infos.items():
-        success = bool(success_by_episode[ep_idx])
-        rewards = torch.full((info.length,), -1.0, dtype=torch.float32)
-        rewards[-1] = 0.0 if success else -float(c_fail)
-
-        returns = torch.flip(torch.cumsum(torch.flip(rewards, dims=[0]), dim=0), dims=[0])
-        max_len_for_task = float(task_max_episode_len[info.task])
-        normalized_returns = torch.clamp(returns / max_len_for_task, min=-1.0, max=0.0)
-        target_bins = _discretize_values(normalized_returns, num_value_bins=num_value_bins)
-
-        for offset, abs_index in enumerate(range(info.start_index, info.end_index)):
-            if abs_index not in abs_to_rel_idx:
-                continue
-            rel_idx = abs_to_rel_idx[abs_index]
-            frame_targets.append(
-                FrameTarget(
-                    frame_index=rel_idx,
-                    episode_index=ep_idx,
-                    success=int(success),
-                    task=info.task,
-                    target_value=_to_float(normalized_returns[offset]),
-                    target_bin=_to_int(target_bins[offset]),
-                )
+    for rel_idx in range(len(hf_dataset)):
+        ep_idx = _to_int(episode_index_col[rel_idx])
+        if ep_idx not in episode_infos:
+            continue
+        info = episode_infos[ep_idx]
+        frame_targets.append(
+            FrameTarget(
+                frame_index=rel_idx,
+                episode_index=ep_idx,
+                success=int(success_col[rel_idx] > 0.5),
+                task=info.task,
+                target_value=float(target_value_col[rel_idx]),
+                target_bin=int(target_bin_col[rel_idx]),
             )
+        )
 
     if not frame_targets:
-        raise ValueError("No frame targets were constructed. Check dataset episodes and CSV labels.")
+        raise ValueError(
+            "No frame targets found. Check that the dataset has non-empty RECAP columns."
+        )
 
     return frame_targets
 
@@ -1026,12 +959,12 @@ def run_recap_value_train_val(cfg: RECAPValueTrainingConfig) -> None:
         episodes=cfg.episodes,
     )
 
-    labels_csv_path = _resolve_labels_csv_path(cfg)
-    logging.info(f"Using episode labels from: {labels_csv_path}")
-    success_by_episode = _load_episode_success_map(labels_csv_path)
+    logging.info(
+        "Reading RECAP targets from dataset columns "
+        f"[{EPISODE_SUCCESS_FEATURE}, {RECAP_NORMALIZED_RETURN_FEATURE}, {RECAP_VALUE_TARGET_FEATURE}]"
+    )
     frame_targets = _build_frame_targets(
         dataset=dataset,
-        success_by_episode=success_by_episode,
         c_fail=cfg.c_fail,
         num_value_bins=cfg.num_value_bins,
     )
