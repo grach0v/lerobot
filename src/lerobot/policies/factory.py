@@ -50,6 +50,7 @@ from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
+from .pistar06.configuration_pistar06 import PiStar06Config
 from .pretrained import PreTrainedPolicy
 from .sac.configuration_sac import SACConfig
 from .sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -128,6 +129,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pistar06":
+        from .pistar06.modeling_pistar06 import PiStar06Policy
+
+        return PiStar06Policy
     elif name == "sac":
         from .sac.modeling_sac import SACPolicy
 
@@ -196,6 +201,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pistar06":
+        return PiStar06Config(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
